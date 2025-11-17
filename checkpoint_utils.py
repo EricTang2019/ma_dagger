@@ -104,15 +104,47 @@ def maybe_materialize_hf_weights(fsdp_dir: Path) -> Path:
 
 def resolve_model_dir_for_vllm(path: str) -> str:
     root = Path(path)
-    target = maybe_materialize_hf_weights(root)
-    if target is root:
-        hf_subdir = root / "huggingface"
-        if _has_hf_config_dir(hf_subdir) and _hf_weights_exist(hf_subdir):
-            return str(hf_subdir)
-        if _has_hf_config_dir(root) and _hf_weights_exist(root):
-            return str(root)
-        return str(root)
-    return str(target)
+    if not root.exists():
+        logger.debug(
+            "Checkpoint path %s does not exist locally; returning raw spec for vLLM to resolve.",
+            path,
+        )
+        return path
+
+    def _pick_dir(candidate: Path) -> Optional[Path]:
+        if _has_hf_config_dir(candidate) and _hf_weights_exist(candidate):
+            return candidate
+        hf_sub = candidate / "huggingface"
+        if _has_hf_config_dir(hf_sub) and _hf_weights_exist(hf_sub):
+            return hf_sub
+        return None
+
+    def _try_materialize(candidate: Path) -> Optional[Path]:
+        resolved = maybe_materialize_hf_weights(candidate)
+        if resolved is not candidate:
+            pick = _pick_dir(resolved)
+            if pick:
+                return pick
+        return _pick_dir(candidate)
+
+    first = _try_materialize(root)
+    if first:
+        return str(first)
+
+    # Search nested directories (newest first) for a valid export.
+    subdirs = sorted(
+        (p for p in root.rglob("*") if p.is_dir()),
+        key=lambda p: (p.stat().st_mtime, p.as_posix()),
+        reverse=True,
+    )
+    for sub in subdirs:
+        pick = _try_materialize(sub)
+        if pick:
+            return str(pick)
+
+    raise FileNotFoundError(
+        f"No HuggingFace-format checkpoint (config.json + weights) found under '{root}'."
+    )
 
 
 def cleanup_checkpoint_dir(candidate: Optional[Path], latest: Path, base_dir: Path):

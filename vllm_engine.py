@@ -10,6 +10,25 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
+try:  # pragma: no cover - best-effort version detection
+    from vllm import __version__ as _VLLM_VERSION
+except Exception:  # pragma: no cover
+    _VLLM_VERSION = "0.0.0"
+
+
+def _version_tuple(text: str) -> Tuple[int, int, int]:
+    parts = text.split(".")
+    result = []
+    for i in range(3):
+        try:
+            result.append(int(parts[i]))
+        except Exception:
+            result.append(0)
+    return tuple(result)  # type: ignore[return-value]
+
+
+_VLLM_SUPPORTS_RESET_PREFIX_CACHE = _version_tuple(_VLLM_VERSION) >= (0, 12, 0)
+
 logger = logging.getLogger(__name__)
 _SP_SUPPORTED_KWARGS = set(inspect.signature(SamplingParams).parameters.keys())
 _SP_UNSUPPORTED_WARNED: set[str] = set()
@@ -245,11 +264,17 @@ class VLLMChatEngine:
                     except TypeError:
                         self.llm.collective_rpc("update_config", args=(overrides,))
                     self.llm.collective_rpc("reload_weights")
-                    try:
-                        self.llm.collective_rpc("reset_prefix_cache")
-                        cache_reset = True
-                    except Exception as cache_err:  # pragma: no cover - best effort
-                        logger.debug("reset_prefix_cache unavailable: %s", cache_err)
+                    if _VLLM_SUPPORTS_RESET_PREFIX_CACHE:
+                        try:
+                            self.llm.collective_rpc("reset_prefix_cache")
+                            cache_reset = True
+                        except Exception as cache_err:  # pragma: no cover - best effort
+                            logger.debug("reset_prefix_cache unavailable: %s", cache_err)
+                    else:
+                        logger.debug(
+                            "Skipping reset_prefix_cache; vLLM %s does not expose this RPC.",
+                            _VLLM_VERSION,
+                        )
                     self._update_cfg_after_reload(new_model_dir, new_tokenizer_dir)
                     self._set_default_sampling_params()
                     return

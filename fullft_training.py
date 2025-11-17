@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import pandas as pd
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
+from checkpoint_utils import _has_hf_config_dir, _hf_weights_exist
 from rllm.trainer.agent_sft_trainer import AgentSFTTrainer
 
 logger = logging.getLogger(__name__)
@@ -430,7 +432,14 @@ def _locate_latest_ckpt(out_dir: str, project_name: str, experiment_name: str) -
         if p.is_dir() and (re.search(r"global_step_\d+", p.name) or re.search(r"epoch_\d+", p.name))
     ]
     if not ckpts:
-        return str(base_dir)
+        hf_dir = base_dir / "huggingface"
+        if _has_hf_config_dir(hf_dir) and _hf_weights_exist(hf_dir):
+            return str(hf_dir)
+        if _has_hf_config_dir(base_dir) and _hf_weights_exist(base_dir):
+            return str(base_dir)
+        raise FileNotFoundError(
+            f"No checkpoints found under '{base_dir}'. Ensure training completed successfully."
+        )
     latest = sorted(ckpts, key=lambda p: (p.stat().st_mtime, p.name))[-1]
     return str(latest)
 
@@ -446,6 +455,39 @@ def _train_once_cli(args):
         config_name=args.config_name,
         config_override=args.config_override,
     )
+
+
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Helper entry points for full fine-tuning.")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
+
+    train = subparsers.add_parser(
+        "_train_once",
+        help="Internal target executed via torchrun to launch AgentSFTTrainer.",
+    )
+    train.add_argument("--which", choices=["gen", "ver"], required=True)
+    train.add_argument("--sft_path", required=True)
+    train.add_argument("--base_model_path", required=True)
+    train.add_argument("--project_name", required=True)
+    train.add_argument("--experiment_name", required=True)
+    train.add_argument("--out_dir", required=True)
+    train.add_argument("--config_name", default="agent_sft_trainer")
+    train.add_argument("--config_override", nargs="*", default=None)
+    return parser
+
+
+def _main(argv: Optional[Sequence[str]] = None):
+    parser = _build_cli_parser()
+    parsed = parser.parse_args(args=None if argv is None else list(argv))
+    if parsed.command == "_train_once":
+        _train_once_cli(parsed)
+    else:  # pragma: no cover - defensive
+        parser.error(f"Unknown command: {parsed.command}")
+
+
+if __name__ == "__main__":
+    _main()
 
 
 __all__ = [
