@@ -6,7 +6,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from .vllm_engine import VLLMChatEngine, call_engine, trim_history
+from vllm_engine import VLLMChatEngine, call_engine, trim_history
 
 logger = logging.getLogger(__name__)
 

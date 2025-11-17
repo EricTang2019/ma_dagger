@@ -8,7 +8,7 @@ from rllm.engine import AgentWorkflowEngine
 from rllm.rewards.reward_fn import math_reward_fn
 from rllm.workflows.workflow import TerminationReason, Workflow
 
-from .genver_teacher import (
+from genver_teacher import (
     BOXED,
     GEN_SYSTEM,
     MAX_ROLLOUT_HISTORY,
@@ -18,7 +18,7 @@ from .genver_teacher import (
     teacher_label_for_generator,
     teacher_label_for_verifier,
 )
-from .vllm_engine import VLLMChatEngine, call_engine, trim_history
+from vllm_engine import VLLMChatEngine, call_engine, trim_history
 
 
 class GenVerDaggerWorkflow(Workflow):

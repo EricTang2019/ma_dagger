@@ -8,16 +8,18 @@ conda create -y -n rllm python=3.10
 conda activate rllm
 python -m pip install --upgrade pip
 pip install -r requirements.txt
+pip install -e .
 ```
-
-- `requirements.txt` reuses `rllm/verl/requirements.txt`, installs `rllm` in editable mode, and pins
-  `vllm==0.11.0` (matching the recorded rllm env in `MADAgger/wandb/run-20251116_100911-qp3ggvk9/files/requirements.txt`).
+- `requirements.txt` reuses `rllm/verl/requirements.txt` and pins `vllm==0.11.0`
+  (matching the recorded rllm env in `wandb/run-20251116_100911-qp3ggvk9/files/requirements.txt`).
 - Install optional extras as needed, e.g. `pip install -r rllm/docs/requirements.txt`.
+- Make sure the dataset you reference (e.g. `gsm8k`, `deepscaler_math`) has been registered with
+  `DatasetRegistry` via rLLM’s data-prep scripts.
 
 ## Usage
 Roll alternating generator/verifier rounds:
 ```bash
-python MADAgger/gen_ver_dagger_fullft_vllm.py iterate \
+python gen_ver_dagger_fullft_vllm.py iterate \
   --dataset_name deepscaler_math --split train --rounds 5 --batch_tasks 256 \
   --teacher_base Qwen/Qwen3-4B --gen_base Qwen/Qwen3-0.6B --ver_base Qwen/Qwen3-0.6B \
   --out_dir runs/genver_fullft --project_name genver_fullft --experiment_name exp \
@@ -26,7 +28,7 @@ python MADAgger/gen_ver_dagger_fullft_vllm.py iterate \
 
 Collect SFT rows without training:
 ```bash
-python MADAgger/gen_ver_dagger_fullft_vllm.py collect \
+python gen_ver_dagger_fullft_vllm.py collect \
   --dataset_name deepscaler_math --split train --num_tasks 512 \
   --teacher_base Qwen/Qwen3-4B --gen_base Qwen/Qwen3-0.6B --ver_base Qwen/Qwen3-0.6B \
   --save_prefix datasets/collect --parallel 64
