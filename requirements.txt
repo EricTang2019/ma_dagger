@@ -1,0 +1,8 @@
+# Base dependencies used by the Gen–Ver DAgger pipeline
+-r rllm/verl/requirements.txt
+
+# Install rLLM itself in editable mode so Hydra configs/workflows are importable
+-e rllm
+
+# Pin vLLM to the version used in the recorded rllm env
+vllm==0.11.0
