@@ -4,14 +4,26 @@ Minimal instructions for bringing up the generator–verifier DAgger pipeline.
 
 ## Setup
 ```bash
-conda create -y -n rllm python=3.10
-conda activate rllm
+conda create -y -n madagger python=3.10
+conda activate madagger
 python -m pip install --upgrade pip
 pip install -r requirements.txt
+
+# Install the upstream rLLM dependency (clone inside this project; install manually to keep Torch/vLLM pinned).
+git clone --recurse-submodules https://github.com/rllm-org/rllm.git deps/rllm
+pushd deps/rllm
+pip install -e .
+# Install the Verl python package from the same repo (this command must be run inside deps/rllm).
+pip install --no-deps -e verl
+popd
+
+# Finally install this repo
 pip install -e .
 ```
-- `requirements.txt` reuses `rllm/verl/requirements.txt` and pins `vllm==0.11.0`
-  (matching the recorded rllm env in `wandb/run-20251116_100911-qp3ggvk9/files/requirements.txt`).
+- `requirements.txt` lists only the pip-installable Python packages (rLLM 0.2.0, VERL extras, Torch 2.8, vLLM 0.11, etc.).
+  CUDA toolkits, `_libgcc_mutex`, and other Conda/NVIDIA components still need to come from the conda env you create
+  in the first two commands.
+- `flash-attn>=2.7.4` is included for Verl; if pip hits a build error, rerun `pip install "flash-attn>=2.7.4" --no-build-isolation`.
 - Install optional extras as needed, e.g. `pip install -r rllm/docs/requirements.txt`.
 - Make sure the dataset you reference (e.g. `gsm8k`, `deepscaler_math`) has been registered with
   `DatasetRegistry` via rLLM’s data-prep scripts.
