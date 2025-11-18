@@ -130,9 +130,11 @@ async def teacher_label_for_generator(
 async def teacher_label_for_verifier(
     teacher_engine: VLLMChatEngine,
     question: str,
+    history_before_v: List[Dict[str, str]],
     g_output: str,
     retries: int = TEACHER_PARSE_RETRIES,
 ) -> Dict[str, Any]:
+    hist_payload = trim_history(history_before_v, limit=MAX_TEACHER_HISTORY)
     user_prompt = {
         "role": "user",
         "content": (
@@ -142,6 +144,8 @@ async def teacher_label_for_verifier(
             "In <fixed_answer>, if the correct final numeric answer is known, ALWAYS include it as \\boxed{...}; "
             "if the generator is already correct, copy the same \\boxed{...}; otherwise leave it empty.\n\n"
             f"Question: {question}\n"
+            "Verifier-visible history up to (but not including) the student's current verifier reply:\n"
+            f"{json.dumps(hist_payload, ensure_ascii=False)}\n\n"
             f"Generator message: {g_output}"
         ),
     }
