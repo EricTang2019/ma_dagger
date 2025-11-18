@@ -6,7 +6,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from vllm_engine import VLLMChatEngine, call_engine, trim_history
+from vllm_engine import VLLMChatEngine, call_engine
 
 logger = logging.getLogger(__name__)
 
@@ -77,13 +77,13 @@ def parse_json_loose(text: str) -> Dict[str, Any]:
 async def teacher_label_for_generator(
     teacher_engine: VLLMChatEngine,
     question: str,
-    history_before_g: List[Dict[str, str]],
+    prompt_messages: List[Dict[str, str]],
     last_g_output: str,
     ground_truth: Optional[Any] = None,
     retries: int = TEACHER_PARSE_RETRIES,
 ) -> Dict[str, Any]:
     gt_str = f"{ground_truth}" if ground_truth is not None else "UNKNOWN"
-    hist_payload = trim_history(history_before_g, limit=MAX_TEACHER_HISTORY)
+    hist_payload = prompt_messages
     user_prompt = {
         "role": "user",
         "content": (
@@ -91,7 +91,7 @@ async def teacher_label_for_generator(
             "Keys: 'g_next_message', 'justification', 'status' (one of ['agree','revise']).\n\n"
             f"Question: {question}\n"
             f"Ground truth (may be UNKNOWN): {gt_str}\n"
-            "History up to (but not incl.) student's last generator message: "
+            "History exactly as the student generator saw it at this turn (system/user/assistant, excluding its current reply): "
             f"{json.dumps(hist_payload, ensure_ascii=False)}\n\n"
             f"Student's last generator message: {last_g_output}"
         ),
@@ -134,7 +134,7 @@ async def teacher_label_for_verifier(
     g_output: str,
     retries: int = TEACHER_PARSE_RETRIES,
 ) -> Dict[str, Any]:
-    hist_payload = trim_history(history_before_v, limit=MAX_TEACHER_HISTORY)
+    hist_payload = history_before_v
     user_prompt = {
         "role": "user",
         "content": (
@@ -144,7 +144,7 @@ async def teacher_label_for_verifier(
             "In <fixed_answer>, if the correct final numeric answer is known, ALWAYS include it as \\boxed{...}; "
             "if the generator is already correct, copy the same \\boxed{...}; otherwise leave it empty.\n\n"
             f"Question: {question}\n"
-            "Verifier-visible history up to (but not including) the student's current verifier reply:\n"
+            "Verifier-visible history EXACTLY as the student verifier saw it at this turn (system/user/assistant, excluding its current reply):\n"
             f"{json.dumps(hist_payload, ensure_ascii=False)}\n\n"
             f"Generator message: {g_output}"
         ),

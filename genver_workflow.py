@@ -63,6 +63,7 @@ class GenVerDaggerWorkflow(Workflow):
 
         for t in range(self.max_turns):
             gen_prompt = trim_history(gen_hist, limit=MAX_ROLLOUT_HISTORY)
+            gen_prompt_for_teacher = [dict(m) for m in gen_prompt]
             g_out = await call_engine(self.gen_engine, gen_prompt)
             g_msg = g_out["content"].strip()
             gen_hist.append({"role": "assistant", "content": g_msg})
@@ -71,7 +72,11 @@ class GenVerDaggerWorkflow(Workflow):
             g_teacher = None
             if self.collect_for in ("both", "gen"):
                 g_teacher = await teacher_label_for_generator(
-                    self.teacher_engine, question, gen_hist[:-1], g_msg, gt
+                    self.teacher_engine,
+                    question,
+                    gen_prompt_for_teacher,
+                    g_msg,
+                    gt,
                 )
 
             gen_traj.steps.append(
@@ -90,8 +95,8 @@ class GenVerDaggerWorkflow(Workflow):
 
             ver_user = VERIFIER_USER_TEMPLATE.format(question=question, generator=g_msg)
             ver_hist.append({"role": "user", "content": ver_user})
-            history_before_verifier = [dict(m) for m in ver_hist]
             ver_prompt = trim_history(ver_hist, limit=MAX_ROLLOUT_HISTORY)
+            ver_prompt_for_teacher = [dict(m) for m in ver_prompt]
             v_out = await call_engine(self.ver_engine, ver_prompt)
             v_msg = v_out["content"].strip()
             ver_hist.append({"role": "assistant", "content": v_msg})
@@ -106,7 +111,7 @@ class GenVerDaggerWorkflow(Workflow):
                 v_teacher = await teacher_label_for_verifier(
                     self.teacher_engine,
                     question,
-                    history_before_verifier,
+                    ver_prompt_for_teacher,
                     g_msg,
                 )
 
