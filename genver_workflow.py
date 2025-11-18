@@ -129,6 +129,10 @@ class GenVerDaggerWorkflow(Workflow):
                 )
             )
 
+            # Feed verifier feedback back to the generator as the next user turn
+            feedback_for_gen = v_msg or ver_user
+            gen_hist.append({"role": "user", "content": feedback_for_gen})
+
             if self.stop_on_verifier_fix and fixed_answer and BOXED.search(fixed_answer):
                 is_correct = bool(reward_obj.is_correct)
                 break
@@ -198,6 +202,8 @@ def episodes_to_sft_rows(episodes: Sequence[Episode]) -> Tuple[List[Dict[str, An
                             {"role": "system", "content": GEN_SYSTEM},
                             {"role": "user", "content": q},
                         ]
+                    elif cleaned_ctx[-1]["role"] != "user":
+                        cleaned_ctx.append({"role": "user", "content": q})
                     row_msgs = cleaned_ctx + [{"role": "assistant", "content": teacher_target}]
                     gen_rows.append({"messages": row_msgs})
                 elif traj.name == "verifier":
