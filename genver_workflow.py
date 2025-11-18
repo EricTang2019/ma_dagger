@@ -90,6 +90,7 @@ class GenVerDaggerWorkflow(Workflow):
 
             ver_user = VERIFIER_USER_TEMPLATE.format(question=question, generator=g_msg)
             ver_hist.append({"role": "user", "content": ver_user})
+            history_before_verifier = [dict(m) for m in ver_hist]
             ver_prompt = trim_history(ver_hist, limit=MAX_ROLLOUT_HISTORY)
             v_out = await call_engine(self.ver_engine, ver_prompt)
             v_msg = v_out["content"].strip()
@@ -102,7 +103,12 @@ class GenVerDaggerWorkflow(Workflow):
 
             v_teacher = None
             if self.collect_for in ("both", "ver"):
-                v_teacher = await teacher_label_for_verifier(self.teacher_engine, question, g_msg)
+                v_teacher = await teacher_label_for_verifier(
+                    self.teacher_engine,
+                    question,
+                    history_before_verifier,
+                    g_msg,
+                )
 
             pred = None
             if fixed_answer and BOXED.search(fixed_answer):
