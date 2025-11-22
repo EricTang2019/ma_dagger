@@ -5,7 +5,7 @@ import dataclasses
 import inspect
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
@@ -32,6 +32,11 @@ _VLLM_SUPPORTS_RESET_PREFIX_CACHE = _version_tuple(_VLLM_VERSION) >= (0, 12, 0)
 logger = logging.getLogger(__name__)
 _SP_SUPPORTED_KWARGS = set(inspect.signature(SamplingParams).parameters.keys())
 _SP_UNSUPPORTED_WARNED: set[str] = set()
+
+
+class ChatEngineProtocol(Protocol):
+    async def get_model_response(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
+        ...
 
 
 class _BatchingVLLM:
@@ -351,5 +356,5 @@ def _load_weights_from_dir(model, model_config, new_model_dir: str):
     vllm_load_weights(model, model_config=model_config, load_format="auto", load_dir=new_model_dir)
 
 
-async def call_engine(engine: VLLMChatEngine, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
+async def call_engine(engine: ChatEngineProtocol, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
     return await engine.get_model_response(messages, **kwargs)

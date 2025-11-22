@@ -18,7 +18,7 @@ from genver_teacher import (
     teacher_label_for_generator,
     teacher_label_for_verifier,
 )
-from vllm_engine import VLLMChatEngine, call_engine, trim_history
+from vllm_engine import ChatEngineProtocol, VLLMChatEngine, call_engine, trim_history
 
 
 class GenVerDaggerWorkflow(Workflow):
@@ -30,7 +30,7 @@ class GenVerDaggerWorkflow(Workflow):
         executor,
         gen_engine: VLLMChatEngine,
         ver_engine: VLLMChatEngine,
-        teacher_engine: VLLMChatEngine,
+        teacher_engine: ChatEngineProtocol,
         max_turns: int = 4,
         stop_on_verifier_fix: bool = False,
         collect_for: str = "both",
@@ -165,7 +165,7 @@ async def rollout_with_workflow_engine(
     tasks: List[Dict[str, Any]],
     gen_engine: VLLMChatEngine,
     ver_engine: VLLMChatEngine,
-    teacher_engine: VLLMChatEngine,
+    teacher_engine: ChatEngineProtocol,
     max_turns: int,
     stop_on_verifier_fix: bool,
     collect_for: str,

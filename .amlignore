@@ -1,0 +1,10 @@
+.venv
+runs
+checkpoints
+.cache
+.ipynb_checkpoints
+__pycache__
+*.pt
+*.bin
+*.safetensors
+*.parquet

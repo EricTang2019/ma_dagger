@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Gen–Ver (Generator–Verifier) DAgger with full-parameter SFT and
-**vLLM rollout for all three models (generator / verifier / teacher)**,
+**vLLM rollout for students (generator / verifier) + async Azure TRAPI teacher (default)**,
 plus **hot in-place weight reload** after each SFT round.
 
 This version applies the reviewer’s suggestions:
@@ -47,6 +47,7 @@ from gpu_utils import (
     parse_cuda_list,
     warn_overlap,
 )
+from triapi_engine import TriApiChatEngine, TriApiConfig
 from vllm_engine import VLLMChatEngine, VLLMConfig
 
 logger = logging.getLogger(__name__)
@@ -80,35 +81,56 @@ async def run_iterate(args: argparse.Namespace):
     gen_sft_path = str(out_dir / "gen_sft.parquet") if not args.gen_sft_path else args.gen_sft_path
     ver_sft_path = str(out_dir / "ver_sft.parquet") if not args.ver_sft_path else args.ver_sft_path
 
-    teacher_devices = parse_cuda_list(getattr(args, "teacher_cuda", None))
+    teacher_backend = getattr(args, "teacher_backend", "triapi").lower()
+    teacher_devices = (
+        parse_cuda_list(getattr(args, "teacher_cuda", None)) if teacher_backend == "vllm" else None
+    )
     gen_devices = parse_cuda_list(getattr(args, "gen_cuda", None))
     ver_devices = parse_cuda_list(getattr(args, "ver_cuda", None))
     teacher_gpu_mem = (
-        args.teacher_gpu_mem_util if getattr(args, "teacher_gpu_mem_util", None) is not None else args.gpu_mem_util
-    )
+        args.teacher_gpu_mem_util if teacher_backend == "vllm" and getattr(args, "teacher_gpu_mem_util", None) is not None else args.gpu_mem_util
+    ) if teacher_backend == "vllm" else None
     gen_gpu_mem = args.gen_gpu_mem_util if getattr(args, "gen_gpu_mem_util", None) is not None else args.gpu_mem_util
     ver_gpu_mem = args.ver_gpu_mem_util if getattr(args, "ver_gpu_mem_util", None) is not None else args.gpu_mem_util
 
-    ensure_tp_fit(teacher_devices, args.tp_t, "teacher")
+    if teacher_backend == "vllm":
+        ensure_tp_fit(teacher_devices, args.tp_t, "teacher")
     ensure_tp_fit(gen_devices, args.tp_s, "generator")
     ensure_tp_fit(ver_devices, args.tp_s, "verifier")
-    if devices_overlap(teacher_devices, gen_devices):
-        warn_overlap("teacher & generator")
-    if devices_overlap(teacher_devices, ver_devices):
-        warn_overlap("teacher & verifier")
+    if teacher_backend == "vllm":
+        if devices_overlap(teacher_devices, gen_devices):
+            warn_overlap("teacher & generator")
+        if devices_overlap(teacher_devices, ver_devices):
+            warn_overlap("teacher & verifier")
     if devices_overlap(gen_devices, ver_devices):
         warn_overlap("generator & verifier")
 
-    with cuda_visible_devices(teacher_devices):
-        teacher_engine = VLLMChatEngine(
-            VLLMConfig(
-                model=args.teacher_base,
-                tokenizer=args.teacher_tokenizer,
-                tp=args.tp_t,
-                gpu_mem_util=teacher_gpu_mem,
-                max_model_len=args.max_model_len,
+    if teacher_backend == "vllm":
+        with cuda_visible_devices(teacher_devices):
+            teacher_engine = VLLMChatEngine(
+                VLLMConfig(
+                    model=args.teacher_base,
+                    tokenizer=args.teacher_tokenizer,
+                    tp=args.tp_t,
+                    gpu_mem_util=teacher_gpu_mem if teacher_gpu_mem is not None else args.gpu_mem_util,
+                    max_model_len=args.max_model_len,
+                    temperature=args.t_temp,
+                    top_p=0.95,
+                )
+            )
+    else:
+        teacher_engine = TriApiChatEngine(
+            TriApiConfig(
+                instance=args.teacher_triapi_instance,
+                deployment=args.teacher_triapi_deployment,
+                scope=args.teacher_triapi_scope,
+                api_version=args.teacher_triapi_api_version,
                 temperature=args.t_temp,
-                top_p=0.95,
+                top_p=1.0,
+                max_output_tokens=args.teacher_triapi_max_output_tokens,
+                timeout_s=args.teacher_triapi_timeout,
+                max_retries=args.teacher_triapi_retries,
+                max_parallel=args.teacher_triapi_max_parallel,
             )
         )
     with cuda_visible_devices(gen_devices):
@@ -212,28 +234,48 @@ async def run_iterate(args: argparse.Namespace):
 
 
 async def run_collect(args: argparse.Namespace):
-    teacher_devices = parse_cuda_list(getattr(args, "teacher_cuda", None))
+    teacher_backend = getattr(args, "teacher_backend", "triapi").lower()
+    teacher_devices = (
+        parse_cuda_list(getattr(args, "teacher_cuda", None)) if teacher_backend == "vllm" else None
+    )
     gen_devices = parse_cuda_list(getattr(args, "gen_cuda", None))
     ver_devices = parse_cuda_list(getattr(args, "ver_cuda", None))
     teacher_gpu_mem = (
-        args.teacher_gpu_mem_util if getattr(args, "teacher_gpu_mem_util", None) is not None else args.gpu_mem_util
-    )
+        args.teacher_gpu_mem_util if teacher_backend == "vllm" and getattr(args, "teacher_gpu_mem_util", None) is not None else args.gpu_mem_util
+    ) if teacher_backend == "vllm" else None
     gen_gpu_mem = args.gen_gpu_mem_util if getattr(args, "gen_gpu_mem_util", None) is not None else args.gpu_mem_util
     ver_gpu_mem = args.ver_gpu_mem_util if getattr(args, "ver_gpu_mem_util", None) is not None else args.gpu_mem_util
-    ensure_tp_fit(teacher_devices, args.tp_t, "teacher")
+    if teacher_backend == "vllm":
+        ensure_tp_fit(teacher_devices, args.tp_t, "teacher")
     ensure_tp_fit(gen_devices, args.tp_s, "generator")
     ensure_tp_fit(ver_devices, args.tp_s, "verifier")
 
-    with cuda_visible_devices(teacher_devices):
-        teacher_engine = VLLMChatEngine(
-            VLLMConfig(
-                model=args.teacher_base,
-                tokenizer=args.teacher_tokenizer,
-                tp=args.tp_t,
-                gpu_mem_util=teacher_gpu_mem,
-                max_model_len=args.max_model_len,
+    if teacher_backend == "vllm":
+        with cuda_visible_devices(teacher_devices):
+            teacher_engine = VLLMChatEngine(
+                VLLMConfig(
+                    model=args.teacher_base,
+                    tokenizer=args.teacher_tokenizer,
+                    tp=args.tp_t,
+                    gpu_mem_util=teacher_gpu_mem if teacher_gpu_mem is not None else args.gpu_mem_util,
+                    max_model_len=args.max_model_len,
+                    temperature=args.t_temp,
+                    top_p=0.95,
+                )
+            )
+    else:
+        teacher_engine = TriApiChatEngine(
+            TriApiConfig(
+                instance=args.teacher_triapi_instance,
+                deployment=args.teacher_triapi_deployment,
+                scope=args.teacher_triapi_scope,
+                api_version=args.teacher_triapi_api_version,
                 temperature=args.t_temp,
-                top_p=0.95,
+                top_p=1.0,
+                max_output_tokens=args.teacher_triapi_max_output_tokens,
+                timeout_s=args.teacher_triapi_timeout,
+                max_retries=args.teacher_triapi_retries,
+                max_parallel=args.teacher_triapi_max_parallel,
             )
         )
     with cuda_visible_devices(gen_devices):
@@ -293,6 +335,21 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--rounds", type=int, default=5)
     i.add_argument("--batch_tasks", type=int, default=256)
     i.add_argument("--seed", type=int, default=0)
+    i.add_argument(
+        "--teacher_backend",
+        type=str,
+        default="triapi",
+        choices=["triapi", "vllm"],
+        help="Teacher backend: Azure TRAPI (chatgpt-5.1) or local vLLM.",
+    )
+    i.add_argument("--teacher_triapi_instance", type=str, default="gcr/shared")
+    i.add_argument("--teacher_triapi_deployment", type=str, default="gpt-5.1-chat_2025-11-13")
+    i.add_argument("--teacher_triapi_scope", type=str, default="api://trapi/.default")
+    i.add_argument("--teacher_triapi_api_version", type=str, default="2024-12-01-preview")
+    i.add_argument("--teacher_triapi_max_parallel", type=int, default=32)
+    i.add_argument("--teacher_triapi_timeout", type=int, default=120)
+    i.add_argument("--teacher_triapi_retries", type=int, default=3)
+    i.add_argument("--teacher_triapi_max_output_tokens", type=int, default=256)
     i.add_argument("--teacher_base", type=str, default="Qwen/Qwen3-4B")
     i.add_argument("--gen_base", type=str, default="Qwen/Qwen3-0.6B")
     i.add_argument("--ver_base", type=str, default="Qwen/Qwen3-0.6B")
@@ -337,12 +394,28 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--split", type=str, default="train")
     c.add_argument("--num_tasks", type=int, default=512)
     c.add_argument("--seed", type=int, default=0)
+    c.add_argument(
+        "--teacher_backend",
+        type=str,
+        default="triapi",
+        choices=["triapi", "vllm"],
+        help="Teacher backend: Azure TRAPI (chatgpt-5.1) or local vLLM.",
+    )
+    c.add_argument("--teacher_triapi_instance", type=str, default="gcr/shared")
+    c.add_argument("--teacher_triapi_deployment", type=str, default="gpt-5.1-chat_2025-11-13")
+    c.add_argument("--teacher_triapi_scope", type=str, default="api://trapi/.default")
+    c.add_argument("--teacher_triapi_api_version", type=str, default="2024-12-01-preview")
+    c.add_argument("--teacher_triapi_max_parallel", type=int, default=32)
+    c.add_argument("--teacher_triapi_timeout", type=int, default=120)
+    c.add_argument("--teacher_triapi_retries", type=int, default=3)
+    c.add_argument("--teacher_triapi_max_output_tokens", type=int, default=256)
     c.add_argument("--teacher_base", type=str, default="Qwen/Qwen3-4B")
     c.add_argument("--gen_base", type=str, default="Qwen/Qwen3-0.6B")
     c.add_argument("--ver_base", type=str, default="Qwen/Qwen3-0.6B")
     c.add_argument("--teacher_tokenizer", type=str, default=None)
     c.add_argument("--gen_tokenizer", type=str, default=None)
     c.add_argument("--ver_tokenizer", type=str, default=None)
+    c.add_argument("--t_temp", type=float, default=0.2)
     c.add_argument("--max_turns", type=int, default=4)
     c.add_argument("--stop_on_verifier_fix", action="store_true")
     c.add_argument("--collect_for", type=str, default="both", choices=["both", "gen", "ver"])

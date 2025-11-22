@@ -6,7 +6,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from vllm_engine import VLLMChatEngine, call_engine
+from vllm_engine import ChatEngineProtocol, call_engine
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ def parse_json_loose(text: str) -> Dict[str, Any]:
 
 
 async def teacher_label_for_generator(
-    teacher_engine: VLLMChatEngine,
+    teacher_engine: ChatEngineProtocol,
     question: str,
     prompt_messages: List[Dict[str, str]],
     last_g_output: str,
@@ -109,6 +109,7 @@ async def teacher_label_for_generator(
                 max_tokens=256,
                 sp_extra={"guided_json": TEACHER_GEN_JSON_SCHEMA},
                 chat_template_kwargs={"enable_thinking": False},
+                response_format={"type": "json_object"},
             )
             data = parse_json_loose(out["content"])
             if "g_next_message" not in data:
@@ -128,7 +129,7 @@ async def teacher_label_for_generator(
 
 
 async def teacher_label_for_verifier(
-    teacher_engine: VLLMChatEngine,
+    teacher_engine: ChatEngineProtocol,
     question: str,
     history_before_v: List[Dict[str, str]],
     g_output: str,
@@ -162,6 +163,7 @@ async def teacher_label_for_verifier(
                 max_tokens=256,
                 sp_extra={"guided_json": TEACHER_VER_JSON_SCHEMA},
                 chat_template_kwargs={"enable_thinking": False},
+                response_format={"type": "json_object"},
             )
             data = parse_json_loose(out["content"])
             if "v_next_message" not in data:

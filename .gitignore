@@ -6,3 +6,7 @@ runs/
 logs/
 *.pt
 *.parquet
+.venv
+collect_traces/
+datasets/
+__pycache__/
