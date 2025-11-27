@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -20,6 +21,16 @@ from genver_teacher import (
 )
 from vllm_engine import ChatEngineProtocol, VLLMChatEngine, call_engine, trim_history
 
+logger = logging.getLogger(__name__)
+_LOG_SNIP = 200
+
+
+def _truncate(text: Any, limit: int = _LOG_SNIP) -> str:
+    if text is None:
+        return ""
+    text = str(text)
+    return text if len(text) <= limit else (text[:limit] + f"...[len={len(text)}]")
+
 
 class GenVerDaggerWorkflow(Workflow):
     """rLLM AgentWorkflowEngine-compatible workflow for joint Gen/Ver rollout."""
@@ -31,7 +42,7 @@ class GenVerDaggerWorkflow(Workflow):
         gen_engine: VLLMChatEngine,
         ver_engine: VLLMChatEngine,
         teacher_engine: ChatEngineProtocol,
-        max_turns: int = 4,
+        max_turns: int = 3,
         stop_on_verifier_fix: bool = False,
         collect_for: str = "both",
         reward_function=math_reward_fn,
@@ -64,8 +75,22 @@ class GenVerDaggerWorkflow(Workflow):
         for t in range(self.max_turns):
             gen_prompt = trim_history(gen_hist, limit=MAX_ROLLOUT_HISTORY)
             gen_prompt_for_teacher = [dict(m) for m in gen_prompt]
+            logger.info(
+                "[rollout/gen] uid=%s turn=%d question=%s",
+                uid,
+                t,
+                _truncate(question),
+            )
+            print(f"[rollout] uid={uid} turn={t+1}/{self.max_turns} GEN question={_truncate(question)}")
             g_out = await call_engine(self.gen_engine, gen_prompt)
             g_msg = g_out["content"].strip()
+            logger.info(
+                "[rollout/gen] uid=%s turn=%d response=%s",
+                uid,
+                t,
+                _truncate(g_msg),
+            )
+            print(f"[rollout] uid={uid} turn={t+1}/{self.max_turns} GEN resp={_truncate(g_msg)}")
             gen_hist.append({"role": "assistant", "content": g_msg})
             gen_ctx = [dict(m) for m in trim_history(gen_hist, limit=MAX_SFT_HISTORY)]
 
@@ -77,6 +102,17 @@ class GenVerDaggerWorkflow(Workflow):
                     gen_prompt_for_teacher,
                     g_msg,
                     gt,
+                )
+                logger.info(
+                    "[teacher/gen] uid=%s turn=%d status=%s target_snip=%s",
+                    uid,
+                    t,
+                    (g_teacher or {}).get("status"),
+                    _truncate((g_teacher or {}).get("g_next_message")),
+                )
+                print(
+                    f"[teacher] uid={uid} turn={t+1}/{self.max_turns} GEN status={(g_teacher or {}).get('status')} "
+                    f"target={_truncate((g_teacher or {}).get('g_next_message'))}"
                 )
 
             gen_traj.steps.append(
@@ -97,9 +133,17 @@ class GenVerDaggerWorkflow(Workflow):
             ver_hist.append({"role": "user", "content": ver_user})
             ver_prompt = trim_history(ver_hist, limit=MAX_ROLLOUT_HISTORY)
             ver_prompt_for_teacher = [dict(m) for m in ver_prompt]
+            print(f"[rollout] uid={uid} turn={t+1}/{self.max_turns} VER prompt_from_gen")
             v_out = await call_engine(self.ver_engine, ver_prompt)
             v_msg = v_out["content"].strip()
             ver_hist.append({"role": "assistant", "content": v_msg})
+            logger.info(
+                "[rollout/ver] uid=%s turn=%d response=%s",
+                uid,
+                t,
+                _truncate(v_msg),
+            )
+            print(f"[rollout] uid={uid} turn={t+1}/{self.max_turns} VER resp={_truncate(v_msg)}")
 
             fixed_answer = None
             m = re.search(r"<fixed_answer>(.*?)</fixed_answer>", v_msg, re.IGNORECASE | re.DOTALL)
@@ -113,6 +157,17 @@ class GenVerDaggerWorkflow(Workflow):
                     question,
                     ver_prompt_for_teacher,
                     g_msg,
+                )
+                logger.info(
+                    "[teacher/ver] uid=%s turn=%d status=%s target_snip=%s",
+                    uid,
+                    t,
+                    (v_teacher or {}).get("status"),
+                    _truncate((v_teacher or {}).get("v_next_message")),
+                )
+                print(
+                    f"[teacher] uid={uid} turn={t+1}/{self.max_turns} VER status={(v_teacher or {}).get('status')} "
+                    f"target={_truncate((v_teacher or {}).get('v_next_message'))}"
                 )
 
             pred = None

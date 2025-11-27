@@ -52,7 +52,42 @@ BOXED = re.compile(r"\\boxed\{([^\}]+)\}")
 MAX_TEACHER_HISTORY = 12
 MAX_SFT_HISTORY = 9
 MAX_ROLLOUT_HISTORY = 12
-TEACHER_PARSE_RETRIES = 2
+TEACHER_PARSE_RETRIES = 5
+_LOG_SNIP = 400
+
+try:  # optional weave tracing
+    import weave  # type: ignore
+except Exception:  # pragma: no cover
+    weave = None
+
+
+if weave:
+
+    @weave.op()
+    async def _weave_call_teacher(label: str, messages: List[Dict[str, str]], call_kwargs: Dict[str, Any]):
+        engine = call_kwargs.pop("_engine")
+        return await call_engine(engine, messages, **call_kwargs)
+
+else:
+
+    async def _weave_call_teacher(label: str, messages: List[Dict[str, str]], call_kwargs: Dict[str, Any]):
+        engine = call_kwargs.pop("_engine")
+        return await call_engine(engine, messages, **call_kwargs)
+
+
+async def _call_teacher_with_trace(
+    label: str, teacher_engine: ChatEngineProtocol, messages: List[Dict[str, str]], **call_kwargs
+):
+    payload = dict(call_kwargs)
+    payload["_engine"] = teacher_engine
+    return await _weave_call_teacher(label=label, messages=messages, call_kwargs=payload)
+
+
+def _truncate(text: str, limit: int = _LOG_SNIP) -> str:
+    if text is None:
+        return ""
+    text = str(text)
+    return text if len(text) <= limit else (text[:limit] + f"...[len={len(text)}]")
 
 
 def parse_json_loose(text: str) -> Dict[str, Any]:
@@ -99,21 +134,33 @@ async def teacher_label_for_generator(
     messages = [{"role": "system", "content": TEACHER_SYSTEM}, user_prompt]
 
     last_err: Optional[Exception] = None
+    last_content: Optional[str] = None
     for attempt in range(1, max(1, retries) + 1):
         try:
-            out = await call_engine(
+            out = await _call_teacher_with_trace(
+                "teacher_gen",
                 teacher_engine,
                 messages,
                 temperature=0.0,
                 top_p=1.0,
-                max_tokens=256,
+                max_tokens=64000,
                 sp_extra={"guided_json": TEACHER_GEN_JSON_SCHEMA},
                 chat_template_kwargs={"enable_thinking": False},
                 response_format={"type": "json_object"},
             )
-            data = parse_json_loose(out["content"])
+            last_content = (out or {}).get("content", "") or ""
+            if not last_content.strip():
+                raise ValueError("Teacher generator returned empty content.")
+            data = parse_json_loose(last_content)
             if "g_next_message" not in data:
                 raise KeyError(f"Teacher JSON missing 'g_next_message': {data}")
+            logger.info(
+                "[teacher/gen] attempt=%d question=%s student_msg=%s response=%s",
+                attempt,
+                _truncate(question),
+                _truncate(last_g_output),
+                _truncate(last_content),
+            )
             return data
         except (ValueError, KeyError) as err:
             last_err = err
@@ -123,9 +170,13 @@ async def teacher_label_for_generator(
                 retries,
                 err,
             )
+            if last_content:
+                logger.warning("Teacher generator raw response (truncated): %s", last_content[:400])
             await asyncio.sleep(0)
     logger.error("Teacher generator labeling failed after %d attempts: %s", retries, last_err)
-    return {}
+    if last_content:
+        logger.error("Last generator teacher raw response (truncated): %s", last_content[:400])
+    return {"error": str(last_err) if last_err else "unknown_error", "raw": (last_content or "")[:400]}
 
 
 async def teacher_label_for_verifier(
@@ -153,21 +204,33 @@ async def teacher_label_for_verifier(
     messages = [{"role": "system", "content": TEACHER_SYSTEM}, user_prompt]
 
     last_err: Optional[Exception] = None
+    last_content: Optional[str] = None
     for attempt in range(1, max(1, retries) + 1):
         try:
-            out = await call_engine(
+            out = await _call_teacher_with_trace(
+                "teacher_ver",
                 teacher_engine,
                 messages,
                 temperature=0.0,
                 top_p=1.0,
-                max_tokens=256,
+                max_tokens=64000,
                 sp_extra={"guided_json": TEACHER_VER_JSON_SCHEMA},
                 chat_template_kwargs={"enable_thinking": False},
                 response_format={"type": "json_object"},
             )
-            data = parse_json_loose(out["content"])
+            last_content = (out or {}).get("content", "") or ""
+            if not last_content.strip():
+                raise ValueError("Teacher verifier returned empty content.")
+            data = parse_json_loose(last_content)
             if "v_next_message" not in data:
                 raise KeyError(f"Teacher JSON missing 'v_next_message': {data}")
+            logger.info(
+                "[teacher/ver] attempt=%d question=%s generator_msg=%s response=%s",
+                attempt,
+                _truncate(question),
+                _truncate(g_output),
+                _truncate(last_content),
+            )
             return data
         except (ValueError, KeyError) as err:
             last_err = err
@@ -177,6 +240,10 @@ async def teacher_label_for_verifier(
                 retries,
                 err,
             )
+            if last_content:
+                logger.warning("Teacher verifier raw response (truncated): %s", last_content[:400])
             await asyncio.sleep(0)
     logger.error("Teacher verifier labeling failed after %d attempts: %s", retries, last_err)
-    return {}
+    if last_content:
+        logger.error("Last verifier teacher raw response (truncated): %s", last_content[:400])
+    return {"error": str(last_err) if last_err else "unknown_error", "raw": (last_content or "")[:400]}

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -53,6 +54,60 @@ from vllm_engine import VLLMChatEngine, VLLMConfig
 logger = logging.getLogger(__name__)
 
 
+def _maybe_init_wandb(args: argparse.Namespace):
+    """Start a lightweight wandb run so teacher/rollout metrics are captured."""
+    try:
+        import wandb  # type: ignore
+    except Exception:
+        return None
+    if getattr(wandb, "run", None):
+        run = wandb.run
+        print(
+            f"[wandb] active run entity={getattr(run, 'entity', None)} "
+            f"project={getattr(run, 'project', None)} name={getattr(run, 'name', None)} "
+            f"url={getattr(run, 'url', None)}"
+        )
+        logger.info(
+            "wandb already active: entity=%s project=%s name=%s url=%s",
+            getattr(run, "entity", None),
+            getattr(run, "project", None),
+            getattr(run, "name", None),
+            getattr(run, "url", None),
+        )
+        return run
+    if not os.environ.get("WANDB_API_KEY"):
+        return None
+    try:
+        run = wandb.init(
+            project=args.project_name or "madagger",
+            name=args.experiment_name,
+            config={
+                "dataset": args.dataset_name,
+                "eval_dataset": getattr(args, "eval_dataset", None),
+                "gen_base": getattr(args, "gen_base", None),
+                "ver_base": getattr(args, "ver_base", None),
+                "teacher_backend": getattr(args, "teacher_backend", None),
+            },
+            reinit=True,
+        )
+        print(
+            f"[wandb] init entity={getattr(run, 'entity', None)} "
+            f"project={getattr(run, 'project', None)} name={getattr(run, 'name', None)} "
+            f"url={getattr(run, 'url', None)}"
+        )
+        logger.info(
+            "wandb init: entity=%s project=%s name=%s url=%s",
+            getattr(run, "entity", None),
+            getattr(run, "project", None),
+            getattr(run, "name", None),
+            getattr(run, "url", None),
+        )
+        return run
+    except Exception as err:  # pragma: no cover - best effort
+        logger.warning("wandb init failed; continuing without trace: %s", err)
+        return None
+
+
 def sample_tasks(dataset_name: str, split: str, n: int, seed: int = 0) -> List[Dict[str, Any]]:
     ds = DatasetRegistry.load_dataset(dataset_name, split)
     if ds is None:
@@ -74,7 +129,76 @@ def sample_tasks(dataset_name: str, split: str, n: int, seed: int = 0) -> List[D
     return tasks
 
 
+def maybe_register_eval_dataset(name: str, split: str) -> None:
+    """Register a small eval dataset on the fly if it isn't already present."""
+    if DatasetRegistry.load_dataset(name, split) is not None:
+        return
+    if name.lower() == "math500":
+        from datasets import load_dataset  # lazy import
+
+        # The HF repo only has a "test" split; fall back to it if a different
+        # split is requested.
+        math_split = split if split else "test"
+        if math_split not in {"test"}:
+            math_split = "test"
+        ds = load_dataset("HuggingFaceH4/MATH-500", split=math_split)
+
+        def to_row(ex):
+            return {
+                "question": ex.get("problem") or ex.get("question") or ex.get("input"),
+                "ground_truth": ex.get("solution") or ex.get("answer") or ex.get("output"),
+                "data_source": "math500",
+            }
+
+        ds = ds.map(to_row)
+        DatasetRegistry.register_dataset(name, ds, split)
+    else:
+        # Leave silently if we don't know how to auto-register this dataset.
+        return
+
+
+async def run_eval(
+    args: argparse.Namespace,
+    gen_engine,
+    ver_engine,
+    teacher_engine,
+    prefix: str,
+):
+    """Lightweight eval: rollout and compute accuracy (is_correct flag)."""
+    maybe_register_eval_dataset(args.eval_dataset, args.eval_split)
+    tasks = sample_tasks(args.eval_dataset, args.eval_split, args.eval_num_tasks, seed=args.seed)
+    print(
+        f"[eval:start-{prefix}] dataset={args.eval_dataset} split={args.eval_split} "
+        f"n={len(tasks)}"
+    )
+    episodes = await rollout_with_workflow_engine(
+        tasks=tasks,
+        gen_engine=gen_engine,
+        ver_engine=ver_engine,
+        teacher_engine=teacher_engine,
+        max_turns=args.max_turns,
+        stop_on_verifier_fix=args.stop_on_verifier_fix,
+        collect_for="none",  # skip teacher labels during eval
+        parallel=min(args.parallel, 32),
+        retry=1,
+    )
+    acc = sum(1 for ep in episodes if getattr(ep, "is_correct", False)) / max(len(episodes), 1)
+    print(
+        f"[eval:{prefix}] dataset={args.eval_dataset} split={args.eval_split} "
+        f"n={len(episodes)} acc={acc:.3f}"
+    )
+    try:
+        import wandb  # type: ignore
+
+        if getattr(wandb, "run", None):
+            wandb.log({f"eval/{prefix}_acc": acc, f"eval/{prefix}_n": len(episodes)})
+    except Exception:
+        pass
+
+
 async def run_iterate(args: argparse.Namespace):
+    maybe_register_eval_dataset(args.eval_dataset, args.eval_split)
+    wandb_run = _maybe_init_wandb(args)
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,7 +249,7 @@ async def run_iterate(args: argparse.Namespace):
                 deployment=args.teacher_triapi_deployment,
                 scope=args.teacher_triapi_scope,
                 api_version=args.teacher_triapi_api_version,
-                temperature=args.t_temp,
+                temperature=None,  # omit temperature so TRAPI uses its default (avoid 400s)
                 top_p=1.0,
                 max_output_tokens=args.teacher_triapi_max_output_tokens,
                 timeout_s=args.teacher_triapi_timeout,
@@ -163,77 +287,105 @@ async def run_iterate(args: argparse.Namespace):
     prev_gen_ckpt_root: Optional[Path] = None
     prev_ver_ckpt_root: Optional[Path] = None
 
-    rounds = args.rounds * 2
-    for r in range(1, rounds + 1):
-        role = "gen" if r % 2 == 1 else "ver"
-        print(f"\n[round {r:03d}] role={role} — sampling, rollout, teacher relabel, full-FT, hot-reload")
+    try:
+        if args.eval_before_train:
+            await run_eval(args, gen_engine, ver_engine, teacher_engine, prefix="pretrain")
 
-        tasks = sample_tasks(args.dataset_name, args.split, args.batch_tasks, seed=args.seed + r)
-        episodes = await rollout_with_workflow_engine(
-            tasks=tasks,
-            gen_engine=gen_engine,
-            ver_engine=ver_engine,
-            teacher_engine=teacher_engine,
-            max_turns=args.max_turns,
-            stop_on_verifier_fix=args.stop_on_verifier_fix,
-            collect_for=role if args.collect_for == "auto" else args.collect_for,
-            parallel=args.parallel,
-            retry=1,
-        )
-        gen_rows, ver_rows = episodes_to_sft_rows(episodes)
-        if role in {"gen", "both"} and gen_rows:
-            append_parquet(gen_rows, gen_sft_path)
-            print(f"[round {r:03d}] +{len(gen_rows)} gen rows -> {gen_sft_path}")
-        if role in {"ver", "both"} and ver_rows:
-            append_parquet(ver_rows, ver_sft_path)
-            print(f"[round {r:03d}] +{len(ver_rows)} ver rows -> {ver_sft_path}")
+        rounds = args.rounds * 2
+        for r in range(1, rounds + 1):
+            role = "gen" if r % 2 == 1 else "ver"
+            print(f"\n[round {r:03d}] role={role} — sampling, rollout, teacher relabel, full-FT, hot-reload")
+            logger.info("[round %03d] start role=%s", r, role)
+            print(f"[round {r:03d}] START role={role}")
 
-        exp_name = f"{args.experiment_name}_{role}_r{r:03d}"
-        if role == "gen" and Path(gen_sft_path).exists():
-            new_ckpt = run_fullft_one_round(
-                which="gen",
-                sft_path=gen_sft_path,
-                base_model_path=gen_ckpt,
-                project_name=args.project_name,
-                experiment_name=exp_name,
-                out_dir=args.out_dir,
-                config_name=args.config_name,
-                config_override=args.config_override,
-                use_subprocess=not args.train_inline,
-                train_cuda=args.train_cuda,
+            tasks = sample_tasks(args.dataset_name, args.split, args.batch_tasks, seed=args.seed + r)
+            logger.info("[round %03d] sampled %d tasks", r, len(tasks))
+            print(f"[round {r:03d}] sampled {len(tasks)} tasks")
+            episodes = await rollout_with_workflow_engine(
+                tasks=tasks,
+                gen_engine=gen_engine,
+                ver_engine=ver_engine,
+                teacher_engine=teacher_engine,
+                max_turns=args.max_turns,
+                stop_on_verifier_fix=args.stop_on_verifier_fix,
+                collect_for=role if args.collect_for == "auto" else args.collect_for,
+                parallel=args.parallel,
+                retry=1,
             )
-            new_ckpt_root = Path(new_ckpt)
-            gen_ckpt = resolve_model_dir_for_vllm(new_ckpt)
-            await gen_engine.hot_reload_from_dir(gen_ckpt)
-            cleanup_checkpoint_dir(prev_gen_ckpt_root, new_ckpt_root, out_dir)
-            prev_gen_ckpt_root = new_ckpt_root
-            print(f"[round {r:03d}] generator hot-reloaded -> {gen_ckpt}")
-        elif role == "ver" and Path(ver_sft_path).exists():
-            new_ckpt = run_fullft_one_round(
-                which="ver",
-                sft_path=ver_sft_path,
-                base_model_path=ver_ckpt,
-                project_name=args.project_name,
-                experiment_name=exp_name,
-                out_dir=args.out_dir,
-                config_name=args.config_name,
-                config_override=args.config_override,
-                use_subprocess=not args.train_inline,
-                train_cuda=args.train_cuda,
-            )
-            new_ckpt_root = Path(new_ckpt)
-            ver_ckpt = resolve_model_dir_for_vllm(new_ckpt)
-            await ver_engine.hot_reload_from_dir(ver_ckpt)
-            cleanup_checkpoint_dir(prev_ver_ckpt_root, new_ckpt_root, out_dir)
-            prev_ver_ckpt_root = new_ckpt_root
-            print(f"[round {r:03d}] verifier hot-reloaded -> {ver_ckpt}")
-        else:
-            print(f"[round {r:03d}] no SFT rows for {role}, skipping FT.")
+            gen_rows, ver_rows = episodes_to_sft_rows(episodes)
+            if role in {"gen", "both"} and gen_rows:
+                append_parquet(gen_rows, gen_sft_path)
+                print(f"[round {r:03d}] +{len(gen_rows)} gen rows -> {gen_sft_path}")
+            if role in {"ver", "both"} and ver_rows:
+                append_parquet(ver_rows, ver_sft_path)
+                print(f"[round {r:03d}] +{len(ver_rows)} ver rows -> {ver_sft_path}")
+
+            exp_name = f"{args.experiment_name}_{role}_r{r:03d}"
+            if role == "gen" and Path(gen_sft_path).exists():
+                logger.info("[round %03d] SFT training generator rows=%d", r, len(gen_rows))
+                print(f"[round {r:03d}] SFT start (generator) rows={len(gen_rows)}")
+                new_ckpt = run_fullft_one_round(
+                    which="gen",
+                    sft_path=gen_sft_path,
+                    base_model_path=gen_ckpt,
+                    project_name=args.project_name,
+                    experiment_name=exp_name,
+                    out_dir=args.out_dir,
+                    config_name=args.config_name,
+                    config_override=args.config_override,
+                    use_subprocess=not args.train_inline,
+                    train_cuda=args.train_cuda,
+                )
+                new_ckpt_root = Path(new_ckpt)
+                gen_ckpt = resolve_model_dir_for_vllm(new_ckpt)
+                logger.info("[round %03d] hot-reload generator from %s", r, gen_ckpt)
+                print(f"[round {r:03d}] hot-reload generator -> {gen_ckpt}")
+                await gen_engine.hot_reload_from_dir(gen_ckpt)
+                cleanup_checkpoint_dir(prev_gen_ckpt_root, new_ckpt_root, out_dir)
+                prev_gen_ckpt_root = new_ckpt_root
+                print(f"[round {r:03d}] generator hot-reloaded -> {gen_ckpt}")
+            elif role == "ver" and Path(ver_sft_path).exists():
+                logger.info("[round %03d] SFT training verifier rows=%d", r, len(ver_rows))
+                print(f"[round {r:03d}] SFT start (verifier) rows={len(ver_rows)}")
+                new_ckpt = run_fullft_one_round(
+                    which="ver",
+                    sft_path=ver_sft_path,
+                    base_model_path=ver_ckpt,
+                    project_name=args.project_name,
+                    experiment_name=exp_name,
+                    out_dir=args.out_dir,
+                    config_name=args.config_name,
+                    config_override=args.config_override,
+                    use_subprocess=not args.train_inline,
+                    train_cuda=args.train_cuda,
+                )
+                new_ckpt_root = Path(new_ckpt)
+                ver_ckpt = resolve_model_dir_for_vllm(new_ckpt)
+                logger.info("[round %03d] hot-reload verifier from %s", r, ver_ckpt)
+                print(f"[round {r:03d}] hot-reload verifier -> {ver_ckpt}")
+                await ver_engine.hot_reload_from_dir(ver_ckpt)
+                cleanup_checkpoint_dir(prev_ver_ckpt_root, new_ckpt_root, out_dir)
+                prev_ver_ckpt_root = new_ckpt_root
+                print(f"[round {r:03d}] verifier hot-reloaded -> {ver_ckpt}")
+            else:
+                print(f"[round {r:03d}] no SFT rows for {role}, skipping FT.")
+
+            if args.eval_after_each:
+                await run_eval(args, gen_engine, ver_engine, teacher_engine, prefix=f"round{r:03d}")
+            logger.info("[round %03d] complete", r)
+            print(f"[round {r:03d}] COMPLETE")
+    finally:
+        if wandb_run:
+            try:
+                wandb_run.finish()
+            except Exception:
+                pass
 
     print("\n[done] Alternating full-FT iterations completed.")
 
 
 async def run_collect(args: argparse.Namespace):
+    wandb_run = _maybe_init_wandb(args)
     teacher_backend = getattr(args, "teacher_backend", "triapi").lower()
     teacher_devices = (
         parse_cuda_list(getattr(args, "teacher_cuda", None)) if teacher_backend == "vllm" else None
@@ -270,7 +422,7 @@ async def run_collect(args: argparse.Namespace):
                 deployment=args.teacher_triapi_deployment,
                 scope=args.teacher_triapi_scope,
                 api_version=args.teacher_triapi_api_version,
-                temperature=args.t_temp,
+                temperature=None,  # omit temperature so TRAPI uses its default (avoid 400s)
                 top_p=1.0,
                 max_output_tokens=args.teacher_triapi_max_output_tokens,
                 timeout_s=args.teacher_triapi_timeout,
@@ -321,6 +473,11 @@ async def run_collect(args: argparse.Namespace):
         path = f"{prefix}_ver.parquet"
         append_parquet(ver_rows, path)
         print(f"[collect] wrote {len(ver_rows)} ver rows -> {path}")
+    if wandb_run:
+        try:
+            wandb_run.finish()
+        except Exception:
+            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -343,13 +500,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Teacher backend: Azure TRAPI (chatgpt-5.1) or local vLLM.",
     )
     i.add_argument("--teacher_triapi_instance", type=str, default="gcr/shared")
-    i.add_argument("--teacher_triapi_deployment", type=str, default="gpt-5.1-chat_2025-11-13")
-    i.add_argument("--teacher_triapi_scope", type=str, default="api://trapi/.default")
-    i.add_argument("--teacher_triapi_api_version", type=str, default="2024-12-01-preview")
+    i.add_argument("--teacher_triapi_deployment", type=str, default="gpt-5_2025-08-07")
+    i.add_argument("--teacher_triapi_scope", type=str, default="api://trapi")
+    i.add_argument("--teacher_triapi_api_version", type=str, default="2025-02-01-preview")
     i.add_argument("--teacher_triapi_max_parallel", type=int, default=32)
     i.add_argument("--teacher_triapi_timeout", type=int, default=120)
-    i.add_argument("--teacher_triapi_retries", type=int, default=3)
-    i.add_argument("--teacher_triapi_max_output_tokens", type=int, default=256)
+    i.add_argument("--teacher_triapi_retries", type=int, default=5)
+    i.add_argument(
+        "--teacher_triapi_max_output_tokens",
+        type=int,
+        default=64000,
+        help="Max tokens from TriAPI teacher; omit/<=0 to use service default.",
+    )
     i.add_argument("--teacher_base", type=str, default="Qwen/Qwen3-4B")
     i.add_argument("--gen_base", type=str, default="Qwen/Qwen3-0.6B")
     i.add_argument("--ver_base", type=str, default="Qwen/Qwen3-0.6B")
@@ -376,6 +538,11 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--experiment_name", type=str, default="exp")
     i.add_argument("--config_name", type=str, default="agent_sft_trainer")
     i.add_argument("--config_override", type=str, nargs="*", default=None)
+    i.add_argument("--eval_dataset", type=str, default="math500")
+    i.add_argument("--eval_split", type=str, default="test")
+    i.add_argument("--eval_num_tasks", type=int, default=100)
+    i.add_argument("--eval_before_train", action="store_true", help="Run a baseline eval before training.")
+    i.add_argument("--eval_after_each", action="store_true", help="Run eval after each FT (gen/ver) round.")
     i.add_argument("--gen_sft_path", type=str, default=None)
     i.add_argument("--ver_sft_path", type=str, default=None)
     i.add_argument("--teacher_cuda", type=str, default=None,
@@ -402,13 +569,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Teacher backend: Azure TRAPI (chatgpt-5.1) or local vLLM.",
     )
     c.add_argument("--teacher_triapi_instance", type=str, default="gcr/shared")
-    c.add_argument("--teacher_triapi_deployment", type=str, default="gpt-5.1-chat_2025-11-13")
-    c.add_argument("--teacher_triapi_scope", type=str, default="api://trapi/.default")
-    c.add_argument("--teacher_triapi_api_version", type=str, default="2024-12-01-preview")
+    c.add_argument("--teacher_triapi_deployment", type=str, default="gpt-5_2025-08-07")
+    c.add_argument("--teacher_triapi_scope", type=str, default="api://trapi")
+    c.add_argument("--teacher_triapi_api_version", type=str, default="2025-02-01-preview")
     c.add_argument("--teacher_triapi_max_parallel", type=int, default=32)
     c.add_argument("--teacher_triapi_timeout", type=int, default=120)
-    c.add_argument("--teacher_triapi_retries", type=int, default=3)
-    c.add_argument("--teacher_triapi_max_output_tokens", type=int, default=256)
+    c.add_argument("--teacher_triapi_retries", type=int, default=5)
+    c.add_argument(
+        "--teacher_triapi_max_output_tokens",
+        type=int,
+        default=64000,
+        help="Max tokens from TriAPI teacher; omit/<=0 to use service default.",
+    )
     c.add_argument("--teacher_base", type=str, default="Qwen/Qwen3-4B")
     c.add_argument("--gen_base", type=str, default="Qwen/Qwen3-0.6B")
     c.add_argument("--ver_base", type=str, default="Qwen/Qwen3-0.6B")
@@ -446,6 +618,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
     parser = build_parser()
     args = parser.parse_args()
     if args.cmd == "iterate":

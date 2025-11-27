@@ -4,6 +4,7 @@ checkpoints
 .cache
 .ipynb_checkpoints
 __pycache__
+.git
 *.pt
 *.bin
 *.safetensors

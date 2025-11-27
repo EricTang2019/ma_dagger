@@ -50,3 +50,13 @@ python gen_ver_dagger_fullft_vllm.py collect \
 - Keep teacher/gen/verifier vLLM engines on disjoint GPUs; overlap only if you accept slower runs.
 - Use `--train_inline` to run VERL SFT in-process; the default launches a `torchrun` subprocess.
 - Generated SFT parquet files accumulate under `--out_dir` and are deduplicated automatically.
+
+
+
+
+
+export AZURE_OPENAI_AD_TOKEN="$(az account get-access-token --resource api://trapi --query accessToken -o tsv)" \
+&& python launch_azure_ma_dagger.py
+
+
+
