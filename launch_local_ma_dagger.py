@@ -1,11 +1,7 @@
 """
 Helper to run the madagger pipeline locally on a single 8xGPU node:
-- GPU layout: 2x gen, 2x ver, 2x teacher, 2x SFT/training.
-- Defaults keep the teacher local (vLLM) for easy offline testing, but you can
-  flip to TriAPI by passing --teacher-backend triapi.
-
-This mirrors launch_azure_ma_dagger.py but avoids Azure job submission so you
-can iterate quickly on a workstation.
+- GPU layout: 2x gen, 2x ver, 4x train; teacher uses remote TriAPI (no local GPU).
+- This is intended for quick local/cluster runs without Azure job submission.
 """
 
 from __future__ import annotations
@@ -23,7 +19,7 @@ class LocalConfig:
     dataset_short_name: str = "aimo"
     model_full_name: str = "Qwen/Qwen3-4B"
     batch_tasks: int = 8
-    teacher_backend: str = "vllm"  # "vllm" (default) or "triapi"
+    teacher_backend: str = "triapi"
     teacher_instance: str = "gcr/shared"
     teacher_deployment: str = "gpt-5_2025-08-07"
     teacher_scope: str = "api://trapi"
@@ -45,24 +41,16 @@ def build_local_command(cfg: LocalConfig) -> str:
     if not hf_token:
         raise RuntimeError("HF_TOKEN/HUGGINGFACEHUB_API_TOKEN missing for local run.")
 
-    teacher_flags = ""
-    if cfg.teacher_backend.lower() == "triapi":
-        teacher_flags = (
-            f"--teacher_backend triapi "
-            f"--teacher_triapi_instance {cfg.teacher_instance} "
-            f"--teacher_triapi_deployment {cfg.teacher_deployment} "
-            f"--teacher_triapi_scope {cfg.teacher_scope} "
-            f"--teacher_triapi_api_version {cfg.teacher_api_version} "
-            f"--teacher_triapi_max_output_tokens 64000 "
-            f"--teacher_triapi_max_parallel 8 "
-            f"--teacher_triapi_retries 5 "
-        )
-    else:
-        teacher_flags = (
-            f"--teacher_backend vllm --teacher_base {cfg.model_full_name} "
-            f"--teacher_tokenizer {cfg.model_full_name} --tp_t 2 "
-            f"--teacher_cuda 4,5 "
-        )
+    teacher_flags = (
+        f"--teacher_backend triapi "
+        f"--teacher_triapi_instance {cfg.teacher_instance} "
+        f"--teacher_triapi_deployment {cfg.teacher_deployment} "
+        f"--teacher_triapi_scope {cfg.teacher_scope} "
+        f"--teacher_triapi_api_version {cfg.teacher_api_version} "
+        f"--teacher_triapi_max_output_tokens 64000 "
+        f"--teacher_triapi_max_parallel 8 "
+        f"--teacher_triapi_retries 5 "
+    )
 
     cmd = [
         f"export WANDB_API_KEY={wandb_key} && export WANDB_TOKEN={wandb_key} && "
@@ -71,8 +59,8 @@ def build_local_command(cfg: LocalConfig) -> str:
         "wandb login ${WANDB_API_KEY} --host https://api.wandb.ai &&",
         "python3 register_aimo_dataset.py && python3 register_math500_dataset.py &&",
         "export PYTHONPATH=.:$PYTHONPATH &&",
-        'export GEN_CUDA="0,1" VER_CUDA="2,3" TRAIN_CUDA="6,7" && export TP_PER_STUDENT=2 &&',
-        f'echo "gen gpus=$GEN_CUDA ver gpus=$VER_CUDA teacher gpus=4,5 train gpus=$TRAIN_CUDA tp=$TP_PER_STUDENT" &&',
+        'export GEN_CUDA="0,1" VER_CUDA="2,3" TRAIN_CUDA="4,5,6,7" && export TP_PER_STUDENT=2 &&',
+        f'echo "gen gpus=$GEN_CUDA ver gpus=$VER_CUDA teacher=TriAPI train gpus=$TRAIN_CUDA tp=$TP_PER_STUDENT" &&',
         f"VLLM_WORKER_MULTIPROC_METHOD=spawn WANDB_API_KEY={wandb_key} "
         f"WANDB_ENTITY={cfg.wandb_entity} WANDB_PROJECT={cfg.wandb_project} "
         f"python3 gen_ver_dagger_fullft_vllm.py iterate "
@@ -97,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset_short_name", type=str, default="aimo")
     p.add_argument("--model_full_name", type=str, default="Qwen/Qwen3-4B")
     p.add_argument("--batch_tasks", type=int, default=8)
-    p.add_argument("--teacher_backend", type=str, default="vllm", choices=["vllm", "triapi"])
+    p.add_argument("--teacher_backend", type=str, default="triapi", choices=["vllm", "triapi"])
     p.add_argument("--teacher_triapi_instance", type=str, default="gcr/shared")
     p.add_argument("--teacher_triapi_deployment", type=str, default="gpt-5_2025-08-07")
     p.add_argument("--teacher_triapi_scope", type=str, default="api://trapi")
