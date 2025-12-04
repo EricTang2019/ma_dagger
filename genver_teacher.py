@@ -52,7 +52,7 @@ BOXED = re.compile(r"\\boxed\{([^\}]+)\}")
 MAX_TEACHER_HISTORY = 12
 MAX_SFT_HISTORY = 9
 MAX_ROLLOUT_HISTORY = 12
-TEACHER_PARSE_RETRIES = 5
+TEACHER_PARSE_RETRIES = 10
 _LOG_SNIP = 400
 
 try:  # optional weave tracing
@@ -171,7 +171,10 @@ async def teacher_label_for_generator(
                 err,
             )
             if last_content:
-                logger.warning("Teacher generator raw response (truncated): %s", last_content[:400])
+                logger.warning(
+                    "Teacher generator raw response (truncated): %s",
+                    last_content[:400],
+                )
             await asyncio.sleep(0)
     logger.error("Teacher generator labeling failed after %d attempts: %s", retries, last_err)
     if last_content:
@@ -241,7 +244,10 @@ async def teacher_label_for_verifier(
                 err,
             )
             if last_content:
-                logger.warning("Teacher verifier raw response (truncated): %s", last_content[:400])
+                logger.warning(
+                    "Teacher verifier raw response (truncated): %s",
+                    last_content[:400],
+                )
             await asyncio.sleep(0)
     logger.error("Teacher verifier labeling failed after %d attempts: %s", retries, last_err)
     if last_content:

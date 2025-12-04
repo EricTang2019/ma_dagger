@@ -19,7 +19,7 @@ class LocalConfig:
     dataset_short_name: str = "aimo"
     model_full_name: str = "Qwen/Qwen3-4B"
     batch_tasks: int = 200
-    min_sft_rows: int = 1000
+    min_sft_rows: int = 0
     teacher_backend: str = "triapi"
     teacher_instance: str = "gcr/shared"
     teacher_deployment: str = "gpt-5_2025-08-07"
@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset_short_name", type=str, default="aimo")
     p.add_argument("--model_full_name", type=str, default="Qwen/Qwen3-4B")
     p.add_argument("--batch_tasks", type=int, default=8)
-    p.add_argument("--min_sft_rows", type=int, default=1000)
+    p.add_argument("--min_sft_rows", type=int, default=0)
     p.add_argument("--teacher_backend", type=str, default="triapi", choices=["vllm", "triapi"])
     p.add_argument("--teacher_triapi_instance", type=str, default="gcr/shared")
     p.add_argument("--teacher_triapi_deployment", type=str, default="gpt-5_2025-08-07")

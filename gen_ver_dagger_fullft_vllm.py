@@ -343,9 +343,6 @@ async def run_iterate(args: argparse.Namespace):
 
             exp_name = f"{args.experiment_name}_{role}_r{r:03d}"
             if role == "gen" and Path(gen_sft_path).exists():
-                if gen_total_rows < args.min_sft_rows:
-                    print(f"[round {r:03d}] gen rows={gen_total_rows} < min_sft_rows={args.min_sft_rows}, skip FT.")
-                    continue
                 logger.info("[round %03d] SFT training generator rows=%d", r, len(gen_rows))
                 print(f"[round {r:03d}] SFT start (generator) rows={len(gen_rows)}")
                 t_ft = time.time()
@@ -362,17 +359,18 @@ async def run_iterate(args: argparse.Namespace):
                     train_cuda=args.train_cuda,
                 )
                 new_ckpt_root = Path(new_ckpt)
-                gen_ckpt = resolve_model_dir_for_vllm(new_ckpt)
-                logger.info("[round %03d] hot-reload generator from %s", r, gen_ckpt)
-                print(f"[round {r:03d}] SFT done in {time.time() - t_ft:.1f}s; hot-reload generator -> {gen_ckpt}")
-                await gen_engine.hot_reload_from_dir(gen_ckpt)
-                cleanup_checkpoint_dir(prev_gen_ckpt_root, new_ckpt_root, out_dir)
-                prev_gen_ckpt_root = new_ckpt_root
-                print(f"[round {r:03d}] generator hot-reloaded -> {gen_ckpt}")
+                try:
+                    gen_ckpt = resolve_model_dir_for_vllm(new_ckpt)
+                    logger.info("[round %03d] hot-reload generator from %s", r, gen_ckpt)
+                    print(f"[round {r:03d}] SFT done in {time.time() - t_ft:.1f}s; hot-reload generator -> {gen_ckpt}")
+                    await gen_engine.hot_reload_from_dir(gen_ckpt)
+                    cleanup_checkpoint_dir(prev_gen_ckpt_root, new_ckpt_root, out_dir)
+                    prev_gen_ckpt_root = new_ckpt_root
+                    print(f"[round {r:03d}] generator hot-reloaded -> {gen_ckpt}")
+                except FileNotFoundError as err:
+                    logger.warning("Hot reload generator skipped (no HF weights): %s", err)
+                    print(f"[round {r:03d}] hot-reload skipped (no HF weights); keeping previous gen weights.")
             elif role == "ver" and Path(ver_sft_path).exists():
-                if ver_total_rows < args.min_sft_rows:
-                    print(f"[round {r:03d}] ver rows={ver_total_rows} < min_sft_rows={args.min_sft_rows}, skip FT.")
-                    continue
                 logger.info("[round %03d] SFT training verifier rows=%d", r, len(ver_rows))
                 print(f"[round {r:03d}] SFT start (verifier) rows={len(ver_rows)}")
                 t_ft = time.time()
@@ -389,13 +387,17 @@ async def run_iterate(args: argparse.Namespace):
                     train_cuda=args.train_cuda,
                 )
                 new_ckpt_root = Path(new_ckpt)
-                ver_ckpt = resolve_model_dir_for_vllm(new_ckpt)
-                logger.info("[round %03d] hot-reload verifier from %s", r, ver_ckpt)
-                print(f"[round {r:03d}] SFT done in {time.time() - t_ft:.1f}s; hot-reload verifier -> {ver_ckpt}")
-                await ver_engine.hot_reload_from_dir(ver_ckpt)
-                cleanup_checkpoint_dir(prev_ver_ckpt_root, new_ckpt_root, out_dir)
-                prev_ver_ckpt_root = new_ckpt_root
-                print(f"[round {r:03d}] verifier hot-reloaded -> {ver_ckpt}")
+                try:
+                    ver_ckpt = resolve_model_dir_for_vllm(new_ckpt)
+                    logger.info("[round %03d] hot-reload verifier from %s", r, ver_ckpt)
+                    print(f"[round {r:03d}] SFT done in {time.time() - t_ft:.1f}s; hot-reload verifier -> {ver_ckpt}")
+                    await ver_engine.hot_reload_from_dir(ver_ckpt)
+                    cleanup_checkpoint_dir(prev_ver_ckpt_root, new_ckpt_root, out_dir)
+                    prev_ver_ckpt_root = new_ckpt_root
+                    print(f"[round {r:03d}] verifier hot-reloaded -> {ver_ckpt}")
+                except FileNotFoundError as err:
+                    logger.warning("Hot reload verifier skipped (no HF weights): %s", err)
+                    print(f"[round {r:03d}] hot-reload skipped (no HF weights); keeping previous verifier weights.")
             else:
                 print(f"[round {r:03d}] no SFT rows for {role}, skipping FT.")
 

@@ -17,7 +17,7 @@ class JobConfig:
     dataset_short_name: str
     model_full_name: str
     batch_tasks: int
-    min_sft_rows: int = 1000
+    min_sft_rows: int = 0
     output_dir_placeholder: str = "${outputs.output_dir}"
     wandb_api_key: str = "5f642e1080557e1b07a844b75f8f580e7ff47791"
     teacher_instance: str = "gcr/shared"
@@ -93,7 +93,8 @@ def build_job_command(cfg: JobConfig) -> str:
         f"--out_dir {cfg.output_dir_placeholder}/madagger "
         f"--project_name madagger --experiment_name {cfg.runid} "
         f"--min_sft_rows {cfg.min_sft_rows} "
-        f'--config_override data.max_length=2048 data.truncation=right data.micro_batch_size_per_gpu=1',
+        f'--config_override data.max_length=2048 data.truncation=right data.micro_batch_size_per_gpu=1 '
+        f'trainer.checkpoint.save_contents=[model,optimizer,extra,hf_model]',
     ]
     return " ".join(job_command_list)
 
