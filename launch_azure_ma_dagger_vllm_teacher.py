@@ -44,7 +44,7 @@ def main() -> None:
     ]
     model_full_name = "Qwen/Qwen3-4B"
     dataset_short_name = "aimo"
-    n = 8
+    n = 200
     experiment_name = "ma_dagger_vllm_teacher"
 
     inputs = {
@@ -98,6 +98,7 @@ def main() -> None:
             dataset_short_name=dataset_short_name,
             model_full_name=model_full_name,
             batch_tasks=n,
+            min_sft_rows=1000,
         )
         job_command = build_job_command(base_cfg)
         # Override GPU split to 2/2/2/2 and force vLLM teacher.
@@ -117,6 +118,11 @@ def main() -> None:
             "--teacher_backend vllm --teacher_cuda $TEACHER_CUDA --tp_t ${TP_T:-2} "
             f"--teacher_base {model_full_name} --teacher_tokenizer {model_full_name} "
             "--teacher_gpu_mem_util 0.9 "
+        )
+        # Ensure longer max_length with truncation to avoid SFT length errors.
+        job_command = job_command.replace(
+            "--config_override data.max_length=2048 data.truncation=right",
+            "--config_override data.max_length=4096 data.truncation=right data.micro_batch_size_per_gpu=1",
         )
         # Drop TriAPI preflight; no remote teacher used in this variant.
         job_command = job_command.replace(

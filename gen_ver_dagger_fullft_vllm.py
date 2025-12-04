@@ -32,6 +32,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -129,6 +130,20 @@ def sample_tasks(dataset_name: str, split: str, n: int, seed: int = 0) -> List[D
     return tasks
 
 
+def _count_rows(path: Optional[str]) -> int:
+    if not path:
+        return 0
+    p = Path(path)
+    if not p.exists():
+        return 0
+    try:
+        import pandas as pd  # type: ignore
+
+        return int(len(pd.read_parquet(p)))
+    except Exception:
+        return 0
+
+
 def maybe_register_eval_dataset(name: str, split: str) -> None:
     """Register a small eval dataset on the fly if it isn't already present."""
     if DatasetRegistry.load_dataset(name, split) is not None:
@@ -204,6 +219,8 @@ async def run_iterate(args: argparse.Namespace):
 
     gen_sft_path = str(out_dir / "gen_sft.parquet") if not args.gen_sft_path else args.gen_sft_path
     ver_sft_path = str(out_dir / "ver_sft.parquet") if not args.ver_sft_path else args.ver_sft_path
+    gen_total_rows = _count_rows(gen_sft_path)
+    ver_total_rows = _count_rows(ver_sft_path)
 
     teacher_backend = getattr(args, "teacher_backend", "triapi").lower()
     teacher_devices = (
@@ -294,13 +311,14 @@ async def run_iterate(args: argparse.Namespace):
         rounds = args.rounds * 2
         for r in range(1, rounds + 1):
             role = "gen" if r % 2 == 1 else "ver"
-            print(f"\n[round {r:03d}] role={role} — sampling, rollout, teacher relabel, full-FT, hot-reload")
+            print(f"\n[round {r:03d}/{rounds:03d}] role={role} — sampling, rollout, teacher relabel, full-FT, hot-reload")
             logger.info("[round %03d] start role=%s", r, role)
             print(f"[round {r:03d}] START role={role}")
 
             tasks = sample_tasks(args.dataset_name, args.split, args.batch_tasks, seed=args.seed + r)
             logger.info("[round %03d] sampled %d tasks", r, len(tasks))
             print(f"[round {r:03d}] sampled {len(tasks)} tasks")
+            t_roll = time.time()
             episodes = await rollout_with_workflow_engine(
                 tasks=tasks,
                 gen_engine=gen_engine,
@@ -312,18 +330,25 @@ async def run_iterate(args: argparse.Namespace):
                 parallel=args.parallel,
                 retry=1,
             )
+            print(f"[round {r:03d}] rollout done in {time.time() - t_roll:.1f}s")
             gen_rows, ver_rows = episodes_to_sft_rows(episodes)
             if role in {"gen", "both"} and gen_rows:
                 append_parquet(gen_rows, gen_sft_path)
                 print(f"[round {r:03d}] +{len(gen_rows)} gen rows -> {gen_sft_path}")
+                gen_total_rows += len(gen_rows)
             if role in {"ver", "both"} and ver_rows:
                 append_parquet(ver_rows, ver_sft_path)
                 print(f"[round {r:03d}] +{len(ver_rows)} ver rows -> {ver_sft_path}")
+                ver_total_rows += len(ver_rows)
 
             exp_name = f"{args.experiment_name}_{role}_r{r:03d}"
             if role == "gen" and Path(gen_sft_path).exists():
+                if gen_total_rows < args.min_sft_rows:
+                    print(f"[round {r:03d}] gen rows={gen_total_rows} < min_sft_rows={args.min_sft_rows}, skip FT.")
+                    continue
                 logger.info("[round %03d] SFT training generator rows=%d", r, len(gen_rows))
                 print(f"[round {r:03d}] SFT start (generator) rows={len(gen_rows)}")
+                t_ft = time.time()
                 new_ckpt = run_fullft_one_round(
                     which="gen",
                     sft_path=gen_sft_path,
@@ -339,14 +364,18 @@ async def run_iterate(args: argparse.Namespace):
                 new_ckpt_root = Path(new_ckpt)
                 gen_ckpt = resolve_model_dir_for_vllm(new_ckpt)
                 logger.info("[round %03d] hot-reload generator from %s", r, gen_ckpt)
-                print(f"[round {r:03d}] hot-reload generator -> {gen_ckpt}")
+                print(f"[round {r:03d}] SFT done in {time.time() - t_ft:.1f}s; hot-reload generator -> {gen_ckpt}")
                 await gen_engine.hot_reload_from_dir(gen_ckpt)
                 cleanup_checkpoint_dir(prev_gen_ckpt_root, new_ckpt_root, out_dir)
                 prev_gen_ckpt_root = new_ckpt_root
                 print(f"[round {r:03d}] generator hot-reloaded -> {gen_ckpt}")
             elif role == "ver" and Path(ver_sft_path).exists():
+                if ver_total_rows < args.min_sft_rows:
+                    print(f"[round {r:03d}] ver rows={ver_total_rows} < min_sft_rows={args.min_sft_rows}, skip FT.")
+                    continue
                 logger.info("[round %03d] SFT training verifier rows=%d", r, len(ver_rows))
                 print(f"[round {r:03d}] SFT start (verifier) rows={len(ver_rows)}")
+                t_ft = time.time()
                 new_ckpt = run_fullft_one_round(
                     which="ver",
                     sft_path=ver_sft_path,
@@ -362,7 +391,7 @@ async def run_iterate(args: argparse.Namespace):
                 new_ckpt_root = Path(new_ckpt)
                 ver_ckpt = resolve_model_dir_for_vllm(new_ckpt)
                 logger.info("[round %03d] hot-reload verifier from %s", r, ver_ckpt)
-                print(f"[round {r:03d}] hot-reload verifier -> {ver_ckpt}")
+                print(f"[round {r:03d}] SFT done in {time.time() - t_ft:.1f}s; hot-reload verifier -> {ver_ckpt}")
                 await ver_engine.hot_reload_from_dir(ver_ckpt)
                 cleanup_checkpoint_dir(prev_ver_ckpt_root, new_ckpt_root, out_dir)
                 prev_ver_ckpt_root = new_ckpt_root
@@ -452,6 +481,7 @@ async def run_collect(args: argparse.Namespace):
         )
 
     tasks = sample_tasks(args.dataset_name, args.split, args.num_tasks, seed=args.seed)
+    t_roll = time.time()
     episodes = await rollout_with_workflow_engine(
         tasks=tasks,
         gen_engine=gen_engine,
@@ -462,6 +492,7 @@ async def run_collect(args: argparse.Namespace):
         collect_for=args.collect_for if args.collect_for != "auto" else "both",
         parallel=args.parallel,
     )
+    print(f"[collect] rollout done in {time.time() - t_roll:.1f}s for {len(episodes)} tasks")
     gen_rows, ver_rows = episodes_to_sft_rows(episodes)
 
     prefix = Path(args.save_prefix)
@@ -545,6 +576,8 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--eval_after_each", action="store_true", help="Run eval after each FT (gen/ver) round.")
     i.add_argument("--gen_sft_path", type=str, default=None)
     i.add_argument("--ver_sft_path", type=str, default=None)
+    i.add_argument("--min_sft_rows", type=int, default=1000,
+                   help="Skip FT until accumulated SFT rows reach this threshold.")
     i.add_argument("--teacher_cuda", type=str, default=None,
                    help="Comma-separated GPU ids for the teacher engine (e.g., '2' or '2,3').")
     i.add_argument("--gen_cuda", type=str, default=None,
@@ -603,6 +636,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--teacher_cuda", type=str, default=None)
     c.add_argument("--gen_cuda", type=str, default=None)
     c.add_argument("--ver_cuda", type=str, default=None)
+    c.add_argument("--min_sft_rows", type=int, default=1000)
 
     hidden = sub.add_parser("_train_once", help=argparse.SUPPRESS)
     hidden.add_argument("--which", type=str, choices=["gen", "ver"], required=True)

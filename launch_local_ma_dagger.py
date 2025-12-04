@@ -18,7 +18,8 @@ class LocalConfig:
     runid: str = "local-madagger"
     dataset_short_name: str = "aimo"
     model_full_name: str = "Qwen/Qwen3-4B"
-    batch_tasks: int = 8
+    batch_tasks: int = 200
+    min_sft_rows: int = 1000
     teacher_backend: str = "triapi"
     teacher_instance: str = "gcr/shared"
     teacher_deployment: str = "gpt-5_2025-08-07"
@@ -69,6 +70,7 @@ def build_local_command(cfg: LocalConfig) -> str:
         f"--gen_tokenizer {cfg.model_full_name} --ver_tokenizer {cfg.model_full_name} "
         f"--tp_s $TP_PER_STUDENT --gen_cuda $GEN_CUDA --ver_cuda $VER_CUDA --train_cuda $TRAIN_CUDA "
         f"--parallel 32 "
+        f"--min_sft_rows {cfg.min_sft_rows} "
         f"--eval_dataset {cfg.eval_dataset} --eval_split {cfg.eval_split} --eval_num_tasks {cfg.eval_num_tasks} "
         f"{'--eval_before_train ' if cfg.eval_before_train else ''}"
         f"{'--eval_after_each ' if cfg.eval_after_each else ''}"
@@ -85,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset_short_name", type=str, default="aimo")
     p.add_argument("--model_full_name", type=str, default="Qwen/Qwen3-4B")
     p.add_argument("--batch_tasks", type=int, default=8)
+    p.add_argument("--min_sft_rows", type=int, default=1000)
     p.add_argument("--teacher_backend", type=str, default="triapi", choices=["vllm", "triapi"])
     p.add_argument("--teacher_triapi_instance", type=str, default="gcr/shared")
     p.add_argument("--teacher_triapi_deployment", type=str, default="gpt-5_2025-08-07")

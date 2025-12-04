@@ -17,6 +17,7 @@ class JobConfig:
     dataset_short_name: str
     model_full_name: str
     batch_tasks: int
+    min_sft_rows: int = 1000
     output_dir_placeholder: str = "${outputs.output_dir}"
     wandb_api_key: str = "5f642e1080557e1b07a844b75f8f580e7ff47791"
     teacher_instance: str = "gcr/shared"
@@ -90,7 +91,9 @@ def build_job_command(cfg: JobConfig) -> str:
         f"{'--eval_before_train ' if cfg.eval_before_train else ''}"
         f"{'--eval_after_each ' if cfg.eval_after_each else ''}"
         f"--out_dir {cfg.output_dir_placeholder}/madagger "
-        f"--project_name madagger --experiment_name {cfg.runid}",
+        f"--project_name madagger --experiment_name {cfg.runid} "
+        f"--min_sft_rows {cfg.min_sft_rows} "
+        f'--config_override data.max_length=2048 data.truncation=right data.micro_batch_size_per_gpu=1',
     ]
     return " ".join(job_command_list)
 
@@ -100,6 +103,6 @@ if __name__ == "__main__":
         runid="p1-madagger-aimo-n8-qwen3-4b-msrresrchbasicvc-Singularity-ND96_H100_v5-shard04",
         dataset_short_name="aimo",
         model_full_name="Qwen/Qwen3-4B",
-        batch_tasks=8,
+        batch_tasks=200,
     )
     print(build_job_command(cfg))
