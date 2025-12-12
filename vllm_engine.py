@@ -7,8 +7,24 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import os
+import torch.multiprocessing as mp
+
+# Ensure vLLM workers use spawn to avoid CUDA re-init issues in forked procs.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_START_METHOD", "spawn")
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    # Start method may have been set elsewhere; ignore.
+    pass
+
 from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
+# vLLM 0.11.0 moved LLM/SamplingParams out of the top-level package.
+try:  # pragma: no cover - import shim for multiple vLLM versions
+    from vllm import LLM, SamplingParams  # type: ignore
+except Exception:  # pragma: no cover
+    from vllm.entrypoints.llm import LLM  # type: ignore
+    from vllm.sampling_params import SamplingParams  # type: ignore
 
 try:  # pragma: no cover - best-effort version detection
     from vllm import __version__ as _VLLM_VERSION
@@ -147,6 +163,8 @@ class VLLMConfig:
     gpu_mem_util: float = 0.9
     max_model_len: int = 32768
     dtype: Optional[str] = None
+    # Enable sleep mode so we can call llm.sleep() to release GPU memory between evals.
+    enable_sleep_mode: bool = True
     trust_remote_code: bool = True
     temperature: float = 0.3
     top_p: float = 0.95
@@ -169,6 +187,7 @@ class VLLMChatEngine:
             tensor_parallel_size=cfg.tp,
             gpu_memory_utilization=cfg.gpu_mem_util,
             max_model_len=cfg.max_model_len,
+            enable_sleep_mode=cfg.enable_sleep_mode,
             trust_remote_code=cfg.trust_remote_code,
         )
         if cfg.dtype:

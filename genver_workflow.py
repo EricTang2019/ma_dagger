@@ -115,12 +115,11 @@ class GenVerDaggerWorkflow(Workflow):
                     g_msg,
                 )
 
+            # Score with raw generator message so RewardMathFn can parse/grade internally.
             pred = None
             if fixed_answer and BOXED.search(fixed_answer):
                 pred = BOXED.search(fixed_answer).group(1)
-            elif BOXED.search(g_msg):
-                pred = BOXED.search(g_msg).group(1)
-            reward_obj = self.reward_fn({"question": question, "ground_truth": gt}, pred or "")
+            reward_obj = self.reward_fn({"question": question, "ground_truth": gt}, g_msg)
 
             ver_traj.steps.append(
                 Step(

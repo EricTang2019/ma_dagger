@@ -8,13 +8,26 @@ from typing import Any, Dict, List, Optional
 
 from vllm_engine import VLLMChatEngine, call_engine
 
+# Minimal answer extractor used across scripts (e.g., run_pag_numina.py)
+import re
+
+
+def extract_final_answer(text: str) -> str:
+    """Heuristic to pull the final numeric/text answer from a model output."""
+    if not text:
+        return ""
+    m = re.search(r"\\boxed\{([^}]*)\}", text)
+    if m:
+        return m.group(1).strip()
+    # fallback: last equality on a line
+    m = re.search(r"(?m)^.*?=\s*([^\n]+)$", text)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
+
 logger = logging.getLogger(__name__)
 
-GEN_SYSTEM = (
-    "You are a careful math problem solver. "
-    "Think step by step in <think>...</think>, but present the final answer as \\boxed{...}. "
-    "Be concise and precise."
-)
+GEN_SYSTEM = "Please reason step by step, and put your final answer within \\boxed{...}."
 VER_SYSTEM = (
     "You are an exacting math verifier. Given the question and the generator's last message, output these tags strictly: \n"
     "<verdict>correct|incorrect</verdict>\n"
@@ -49,6 +62,10 @@ TEACHER_VER_JSON_SCHEMA = {
 VERIFIER_USER_TEMPLATE = "Question: {question}\n---\nGenerator message:\n{generator}"
 JSON_BLOCK = re.compile(r"\{.*?\}", re.DOTALL)
 BOXED = re.compile(r"\\boxed\{([^\}]+)\}")
+ANSWER_LINE = re.compile(r"(?:^|\n)\s*(?:final\s+answer|answer|答案)[:：]?\s*([^\n]+)", re.IGNORECASE)
+ANSWER_TAG = re.compile(r"<(?:final_answer|answer|result)>(.*?)</(?:final_answer|answer|result)>", re.IGNORECASE | re.DOTALL)
+ANSWER_IS = re.compile(r"(?:^|\n|\.\s*)\s*the answer is\s*([^\n\.]+)", re.IGNORECASE)
+JSON_ANSWER_KEYS = ("final_answer", "answer", "result", "ground_truth", "label", "output")
 MAX_TEACHER_HISTORY = 12
 MAX_SFT_HISTORY = 9
 MAX_ROLLOUT_HISTORY = 12
@@ -72,6 +89,124 @@ def parse_json_loose(text: str) -> Dict[str, Any]:
     if i != -1 and j != -1 and j > i:
         return json.loads(text[i : j + 1])
     raise ValueError(f"Failed to parse teacher JSON. Head: {text[:200]}")
+
+
+def _coerce_text(message: Any) -> str:
+    """Flatten possibly-structured message/content into a single string."""
+    if message is None:
+        return ""
+    if isinstance(message, str):
+        return message
+    if isinstance(message, dict):
+        # Chat-style dicts
+        if "content" in message:
+            return _coerce_text(message.get("content"))
+        if "text" in message:
+            return _coerce_text(message.get("text"))
+        return str(message)
+    if isinstance(message, list):
+        # Chat history: prefer the last assistant-like content if present
+        msg_dicts = [m for m in message if isinstance(m, dict) and "content" in m]
+        if msg_dicts:
+            for m in reversed(msg_dicts):
+                txt = _coerce_text(m.get("content"))
+                if txt:
+                    return txt
+        parts = [(_coerce_text(m) or "").strip() for m in message]
+        return "\n".join([p for p in parts if p])
+    return str(message)
+
+
+def _clean_answer(ans: Any) -> Optional[str]:
+    """Normalize a candidate answer string."""
+    if ans is None:
+        return None
+    if not isinstance(ans, str):
+        ans = _coerce_text(ans)
+    if not ans:
+        return None
+    # Trim common wrappers/punctuation without touching math content.
+    ans = ans.replace("</s>", "").strip()
+    if BOXED.search(ans):
+        ans = BOXED.findall(ans)[-1]
+    ans = ans.strip().strip("`").strip()
+    ans = ans.rstrip("。.;；,，")
+    return ans.strip() or None
+
+
+def _extract_from_json_blob(text: str) -> Optional[str]:
+    """Best-effort JSON answer extraction for cases where the model emits JSON."""
+    parsed: Any = None
+    for parser in (json.loads, parse_json_loose):
+        try:
+            parsed = parser(text)
+            break
+        except Exception:
+            continue
+    if parsed is None:
+        return None
+
+    def _walk(obj: Any) -> Optional[str]:
+        if isinstance(obj, dict):
+            for key in JSON_ANSWER_KEYS:
+                if key in obj:
+                    cand = _clean_answer(obj[key])
+                    if cand:
+                        return cand
+            for v in obj.values():
+                cand = _walk(v)
+                if cand:
+                    return cand
+        elif isinstance(obj, list):
+            for item in reversed(obj):
+                cand = _walk(item)
+                if cand:
+                    return cand
+        return None
+
+    return _walk(parsed)
+
+
+def extract_final_answer(message: Any) -> Optional[str]:
+    """
+    Extract a concise final answer from a free-form model message.
+
+    Heuristics (in order):
+    - JSON keys like "final_answer"/"answer"/"result"
+    - \\boxed{...}
+    - <final_answer>...</final_answer> or answer tags
+    - Lines starting with "Final answer"/"Answer"/"答案"
+    - Phrases like "The answer is ..."
+    - Fallback to the last non-empty line
+    """
+    text = _coerce_text(message)
+    if not text or not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text:
+        return None
+
+    json_ans = _extract_from_json_blob(text)
+    if json_ans:
+        return json_ans
+
+    for pattern in (BOXED, ANSWER_TAG, ANSWER_LINE, ANSWER_IS):
+        matches = pattern.findall(text)
+        if matches:
+            cand = _clean_answer(matches[-1])
+            if cand:
+                return cand
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if lines:
+        tail = lines[-1]
+        for sep in (":", "-", "->", "="):
+            if sep in tail:
+                tail = tail.split(sep)[-1].strip()
+        cand = _clean_answer(tail)
+        if cand:
+            return cand
+    return None
 
 
 async def teacher_label_for_generator(

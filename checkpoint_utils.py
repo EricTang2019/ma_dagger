@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import inspect
+import os
 import logging
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -102,6 +105,50 @@ def maybe_materialize_hf_weights(fsdp_dir: Path) -> Path:
     return fsdp_dir
 
 
+def _maybe_merge_fsdp_checkpoint(fsdp_dir: Path) -> Optional[Path]:
+    """If the directory looks like a Verl FSDP checkpoint, try merging shards to HF via verl.model_merger."""
+    fsdp_cfg = fsdp_dir / "fsdp_config.json"
+    if not fsdp_cfg.exists():
+        return None
+    target = fsdp_dir / "huggingface_merged"
+    if _has_hf_config_dir(target) and _hf_weights_exist(target):
+        return target
+
+    # Ensure verl is importable by inheriting current PYTHONPATH and appending deps/rllm if present.
+    env = dict(**os.environ)
+    try:
+        repo_root = Path(__file__).resolve().parent
+        rllm_path = (repo_root / "deps" / "rllm").resolve()
+        env["PYTHONPATH"] = (
+            f"{env.get('PYTHONPATH','')}:{rllm_path}" if "PYTHONPATH" in env else str(rllm_path)
+        )
+    except Exception:
+        pass
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "verl.model_merger",
+        "merge",
+        "--backend",
+        "fsdp",
+        "--local_dir",
+        str(fsdp_dir),
+        "--target_dir",
+        str(target),
+    ]
+    try:
+        logger.info("Merging FSDP shards at %s -> %s via verl.model_merger", fsdp_dir, target)
+        subprocess.run(cmd, check=True, env=env)
+    except Exception as err:  # pragma: no cover - best effort merge
+        logger.warning("Failed to merge FSDP checkpoint at %s: %s", fsdp_dir, err)
+        return None
+
+    if _has_hf_config_dir(target) and _hf_weights_exist(target):
+        return target
+    return None
+
+
 def resolve_model_dir_for_vllm(path: str) -> str:
     root = Path(path)
     if not root.exists():
@@ -120,11 +167,19 @@ def resolve_model_dir_for_vllm(path: str) -> str:
         return None
 
     def _try_materialize(candidate: Path) -> Optional[Path]:
+        # 1) Already HF?
         resolved = maybe_materialize_hf_weights(candidate)
         if resolved is not candidate:
             pick = _pick_dir(resolved)
             if pick:
                 return pick
+        # 2) Try to merge Verl FSDP shards if present.
+        merged = _maybe_merge_fsdp_checkpoint(candidate)
+        if merged:
+            pick = _pick_dir(merged)
+            if pick:
+                return pick
+        # 3) Finally, see if candidate itself has HF weights.
         return _pick_dir(candidate)
 
     first = _try_materialize(root)

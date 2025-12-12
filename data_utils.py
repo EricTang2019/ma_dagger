@@ -37,3 +37,47 @@ def append_parquet(rows: List[Dict[str, Any]], path: str):
         df = df.drop(columns="_msg_hash")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     df.to_parquet(path, index=False)
+
+
+def append_sft_rows(rows: List[Dict[str, Any]], path: str):
+    """Append SFT rows to a json/jsonl/parquet file with dedup by messages hash."""
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    # Parquet path: delegate to append_parquet (it already dedups by messages)
+    if path.lower().endswith(".parquet"):
+        append_parquet(rows, path)
+        return
+
+    existing: List[Dict[str, Any]] = []
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, "r", encoding="utf-8") as fin:
+            for line in fin:
+                line = line.strip()
+                if line:
+                    try:
+                        existing.append(json.loads(line))
+                    except Exception:
+                        continue
+
+    # Dedup with new rows overwriting old ones by messages hash
+    def _row_hash(row: Dict[str, Any]) -> str:
+        msgs = row.get("messages") if isinstance(row, dict) else row
+        return _messages_hash_for_row(msgs)
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    for r in existing:
+        try:
+            merged[_row_hash(r)] = r
+        except Exception:
+            continue
+    for r in rows:
+        try:
+            merged[_row_hash(r)] = r
+        except Exception:
+            continue
+
+    with open(path, "w", encoding="utf-8") as fout:
+        for r in merged.values():
+            fout.write(json.dumps(r, ensure_ascii=False) + "\n")
