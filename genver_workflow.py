@@ -73,10 +73,7 @@ class GenVerDaggerWorkflow(Workflow):
             if self.collect_for in ("both", "gen"):
                 g_teacher = await teacher_label_for_generator(
                     self.teacher_engine,
-                    question,
                     gen_prompt_for_teacher,
-                    g_msg,
-                    gt,
                 )
 
             gen_traj.steps.append(
@@ -110,9 +107,7 @@ class GenVerDaggerWorkflow(Workflow):
             if self.collect_for in ("both", "ver"):
                 v_teacher = await teacher_label_for_verifier(
                     self.teacher_engine,
-                    question,
                     ver_prompt_for_teacher,
-                    g_msg,
                 )
 
             # Score with raw generator message so RewardMathFn can parse/grade internally.
