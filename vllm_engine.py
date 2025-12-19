@@ -321,6 +321,22 @@ class VLLMChatEngine:
             self._update_cfg_after_reload(new_model_dir, new_tokenizer_dir)
             self._set_default_sampling_params()
 
+    async def sleep(self, level: int = 1):
+        """Offload model weights to free GPU memory (requires enable_sleep_mode)."""
+        if not hasattr(self.llm, "sleep"):
+            raise RuntimeError("vLLM LLM.sleep is unavailable; upgrade vLLM or disable sleep.")
+        async with self._reload_lock:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self.llm.sleep, level)
+
+    async def wake_up(self):
+        """Reload model weights after sleep()."""
+        if not hasattr(self.llm, "wake_up"):
+            raise RuntimeError("vLLM LLM.wake_up is unavailable; upgrade vLLM or disable sleep.")
+        async with self._reload_lock:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self.llm.wake_up)
+
     def _update_cfg_after_reload(self, new_model_dir: str, new_tokenizer_dir: Optional[str]):
         if new_tokenizer_dir:
             self.tok = AutoTokenizer.from_pretrained(

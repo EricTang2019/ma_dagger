@@ -410,10 +410,33 @@ async def _run_eval_if_needed(
     print(f"[round {round_idx:03d}] eval accuracy data -> {dump_path}")
 
 
+async def _sleep_engines(pairs):
+    for label, engine in pairs:
+        try:
+            await engine.sleep()
+            print(f"[info] {label} engine slept to free GPU memory.")
+        except Exception as err:
+            print(f"[warn] Failed to sleep {label} engine: {err}")
+
+
+async def _wake_engines(pairs):
+    for label, engine in pairs:
+        try:
+            await engine.wake_up()
+            print(f"[info] {label} engine woke up.")
+        except Exception as err:
+            print(f"[warn] Failed to wake {label} engine: {err}")
+
+
 async def run(args: argparse.Namespace):
     _maybe_register_dataset(args.dataset_name, args.split, args.dataset_path, force=args.force_register)
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    train_root = out_dir / "train_ckpts"
+    train_out_dir_gen = train_root / "gen"
+    train_out_dir_ver = train_root / "ver"
+    train_out_dir_gen.mkdir(parents=True, exist_ok=True)
+    train_out_dir_ver.mkdir(parents=True, exist_ok=True)
 
     if args.dump_dataset_head > 0:
         head_tasks = _sample_tasks(args.dataset_name, args.split, args.dump_dataset_head, seed=args.seed)
@@ -529,22 +552,27 @@ async def run(args: argparse.Namespace):
                 tokenizer=getattr(gen_engine, "tok", None),
                 max_tokens=args.train_truncate_tokens,
             )
-            new_ckpt = run_fullft_one_round(
-                which="gen",
-                sft_path=train_sft,
-                base_model_path=gen_ckpt,
-                project_name=args.project_name,
-                experiment_name=exp_name,
-                out_dir=args.out_dir,
-                config_name=args.config_name,
-                config_override=args.config_override,
-                use_subprocess=not args.train_inline,
-                train_cuda=args.train_cuda,
-            )
+            sleepers = [("teacher", teacher_engine), ("generator", gen_engine), ("verifier", ver_engine)]
+            await _sleep_engines(sleepers)
+            try:
+                new_ckpt = run_fullft_one_round(
+                    which="gen",
+                    sft_path=train_sft,
+                    base_model_path=gen_ckpt,
+                    project_name=args.project_name,
+                    experiment_name=exp_name,
+                    out_dir=str(train_out_dir_gen),
+                    config_name=args.config_name,
+                    config_override=args.config_override,
+                    use_subprocess=not args.train_inline,
+                    train_cuda=args.train_cuda,
+                )
+            finally:
+                await _wake_engines(sleepers)
             new_ckpt_root = Path(new_ckpt)
             gen_ckpt = resolve_model_dir_for_vllm(new_ckpt)
             await gen_engine.hot_reload_from_dir(gen_ckpt)
-            cleanup_checkpoint_dir(prev_gen_ckpt, new_ckpt_root, out_dir)
+            cleanup_checkpoint_dir(prev_gen_ckpt, new_ckpt_root, train_out_dir_gen)
             prev_gen_ckpt = new_ckpt_root
             print(f"[round {r:03d}] generator hot-reloaded -> {gen_ckpt}")
         elif role == "ver" and Path(ver_sft_path).exists():
@@ -555,22 +583,27 @@ async def run(args: argparse.Namespace):
                 tokenizer=getattr(ver_engine, "tok", None),
                 max_tokens=args.train_truncate_tokens,
             )
-            new_ckpt = run_fullft_one_round(
-                which="ver",
-                sft_path=train_sft,
-                base_model_path=ver_ckpt,
-                project_name=args.project_name,
-                experiment_name=exp_name,
-                out_dir=args.out_dir,
-                config_name=args.config_name,
-                config_override=args.config_override,
-                use_subprocess=not args.train_inline,
-                train_cuda=args.train_cuda,
-            )
+            sleepers = [("teacher", teacher_engine), ("generator", gen_engine), ("verifier", ver_engine)]
+            await _sleep_engines(sleepers)
+            try:
+                new_ckpt = run_fullft_one_round(
+                    which="ver",
+                    sft_path=train_sft,
+                    base_model_path=ver_ckpt,
+                    project_name=args.project_name,
+                    experiment_name=exp_name,
+                    out_dir=str(train_out_dir_ver),
+                    config_name=args.config_name,
+                    config_override=args.config_override,
+                    use_subprocess=not args.train_inline,
+                    train_cuda=args.train_cuda,
+                )
+            finally:
+                await _wake_engines(sleepers)
             new_ckpt_root = Path(new_ckpt)
             ver_ckpt = resolve_model_dir_for_vllm(new_ckpt)
             await ver_engine.hot_reload_from_dir(ver_ckpt)
-            cleanup_checkpoint_dir(prev_ver_ckpt, new_ckpt_root, out_dir)
+            cleanup_checkpoint_dir(prev_ver_ckpt, new_ckpt_root, train_out_dir_ver)
             prev_ver_ckpt = new_ckpt_root
             print(f"[round {r:03d}] verifier hot-reloaded -> {ver_ckpt}")
         else:
