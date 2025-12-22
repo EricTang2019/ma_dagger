@@ -82,6 +82,8 @@ class _BatchingVLLM:
         return (
             float(getattr(sp, "temperature", 0.0) or 0.0),
             float(getattr(sp, "top_p", 1.0) or 1.0),
+            int(getattr(sp, "top_k", 0) or 0),
+            float(getattr(sp, "min_p", 0.0) or 0.0),
             int(getattr(sp, "max_tokens", 0) or 0),
             stop,
             float(getattr(sp, "repetition_penalty", 1.0) or 1.0),
@@ -168,6 +170,8 @@ class VLLMConfig:
     trust_remote_code: bool = True
     temperature: float = 0.3
     top_p: float = 0.95
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
     max_new_tokens: int = 512
     batch_max: int = 64
     batch_flush_ms: int = 5
@@ -232,6 +236,27 @@ class VLLMChatEngine:
             start += 1
         return (head + body[-1:]) if body else head
 
+    def _build_sampling_params(
+        self,
+        *,
+        temperature: float,
+        top_p: float,
+        max_tokens: int,
+        sp_extra: Optional[Dict[str, Any]] = None,
+    ) -> SamplingParams:
+        extra = dict(sp_extra or {})
+        if "top_k" not in extra and self.cfg.top_k is not None:
+            extra["top_k"] = self.cfg.top_k
+        if "min_p" not in extra and self.cfg.min_p is not None:
+            extra["min_p"] = self.cfg.min_p
+        sp_kwargs = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+        }
+        sp_kwargs.update(_filter_sampling_kwargs(extra))
+        return SamplingParams(**sp_kwargs)
+
     async def get_model_response(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
         temperature = kwargs.get("temperature", self.cfg.temperature)
         top_p = kwargs.get("top_p", self.cfg.top_p)
@@ -241,7 +266,12 @@ class VLLMChatEngine:
         budget = self._token_budget(max_new_tokens)
         trimmed = self._trim_to_budget(messages, budget, chat_kwargs)
         prompt = self.tok.apply_chat_template(trimmed, tokenize=False, add_generation_prompt=True, **chat_kwargs)
-        sp = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_new_tokens, **sp_extra)
+        sp = self._build_sampling_params(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_new_tokens,
+            sp_extra=sp_extra,
+        )
         content = await self._batcher.submit(prompt, sp)
         return {"content": content, "raw": content}
 
@@ -257,7 +287,12 @@ class VLLMChatEngine:
             self.tok.apply_chat_template(m, tokenize=False, add_generation_prompt=True, **chat_kwargs)
             for m in trimmed_msgs
         ]
-        sp = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_new_tokens, **sp_extra)
+        sp = self._build_sampling_params(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_new_tokens,
+            sp_extra=sp_extra,
+        )
         loop = asyncio.get_running_loop()
         if self._reload_lock:
             async with self._reload_lock:
@@ -347,7 +382,7 @@ class VLLMChatEngine:
             self.cfg = dataclasses.replace(self.cfg, model=new_model_dir)
 
     def _set_default_sampling_params(self):
-        self.default_sp = SamplingParams(
+        self.default_sp = self._build_sampling_params(
             temperature=self.cfg.temperature,
             top_p=self.cfg.top_p,
             max_tokens=self.cfg.max_new_tokens,

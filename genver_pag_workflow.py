@@ -9,7 +9,7 @@ from rllm.agents.agent import Episode, Step, Trajectory
 from rllm.engine import AgentWorkflowEngine
 from rllm.rewards.reward_fn import math_reward_fn
 from rllm.workflows.workflow import TerminationReason, Workflow
-from rllm.globals import THOUGHT_DELIMITER_END
+from rllm.globals import THOUGHT_DELIMITER_END, THOUGHT_DELIMITER_START
 
 from genver_teacher import (
     GEN_SYSTEM,
@@ -23,8 +23,10 @@ from vllm_engine import call_engine, trim_history
 PAG_VERIFY_SYSTEM = "You are the verifier model."
 PAG_VERIFY_PROMPT = (
     "Check the generator's math solution step-by-step. "
-    "If you find a mistake: state the wrong step, explain why it's wrong, and end your response with 'The answer is wrong'. "
-    "If all steps are correct, end your response with 'The answer is correct'. Do not provide a corrected final answer; just judge correctness."
+    "If you find a mistake: state the wrong step and explain why it's wrong. "
+    "If all steps are correct, explain why. "
+    "Provide the reasoning and the final judgement of the correctness. "
+    "The last word of your response must be either 'correct' or 'incorrect'."
 )
 PAG_REGENERATE_PROMPT = (
     "The verifier indicated that your previous answer was wrong. Provide the correct solution now. "
@@ -33,9 +35,16 @@ PAG_REGENERATE_PROMPT = (
 
 
 def _extract_judgment(text: str) -> Optional[str]:
-    match = re.search(r"The answer is (correct|wrong)\.", text)
-    if match:
-        return match.group(1).lower()
+    if not text:
+        return None
+    words = re.findall(r"[A-Za-z]+", text.lower())
+    if not words:
+        return None
+    last = words[-1]
+    if last == "wrong":
+        return "incorrect"
+    if last in {"correct", "incorrect"}:
+        return last
     return None
 
 
@@ -45,6 +54,14 @@ def _strip_think(text: str) -> str:
     if THOUGHT_DELIMITER_END in text:
         return text.split(THOUGHT_DELIMITER_END, 1)[1].strip()
     return text
+
+
+def _think_incomplete(text: str) -> bool:
+    if not text:
+        return False
+    if THOUGHT_DELIMITER_END in text:
+        return False
+    return THOUGHT_DELIMITER_START in text
 
 
 def _question_text_from_raw(raw_question: Any) -> str:
@@ -149,6 +166,7 @@ class PAGStyleWorkflow(Workflow):
             gen_prompt_for_teacher = [dict(m) for m in gen_prompt]
             g_out = await call_engine(self.gen_engine, gen_prompt)
             g_msg_raw = g_out["content"].strip()
+            think_incomplete = _think_incomplete(g_msg_raw)
             g_msg_public = _strip_think(g_msg_raw)
             gen_hist.append({"role": "assistant", "content": g_msg_public})
             gen_ctx = [dict(m) for m in trim_history(gen_hist, limit=MAX_SFT_HISTORY)]
@@ -175,8 +193,16 @@ class PAGStyleWorkflow(Workflow):
             )
 
             # === Verifier turn ===
+            ver_input_msg = g_msg_raw if think_incomplete else g_msg_public
+            incomplete_note = ""
+            if think_incomplete:
+                incomplete_note = (
+                    "\n\nNote: The generator's response contains an unfinished <think> block "
+                    "(missing </think>). Treat this as incorrect, but still review the reasoning "
+                    "and mention any other errors you find."
+                )
             verify_user = (
-                f"{PAG_VERIFY_PROMPT}\n\nQuestion:\n{question_text}\n\nPrevious answer:\n{g_msg_public}"
+                f"{PAG_VERIFY_PROMPT}{incomplete_note}\n\nQuestion:\n{question_text}\n\nPrevious answer:\n{ver_input_msg}"
             )
             ver_hist.append({"role": "user", "content": verify_user})
             ver_prompt = trim_history(ver_hist, limit=MAX_ROLLOUT_HISTORY)
@@ -214,7 +240,7 @@ class PAGStyleWorkflow(Workflow):
             )
 
             judgment = _extract_judgment(v_msg_raw)
-            is_correct = bool(reward_obj.is_correct) and judgment == "correct"
+            is_correct = judgment == "correct"
 
             if is_correct:
                 break

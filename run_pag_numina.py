@@ -468,7 +468,9 @@ async def run(args: argparse.Namespace):
                 gpu_mem_util=args.teacher_gpu_mem_util,
                 max_model_len=args.max_model_len,
                 temperature=args.t_temp,
-                top_p=0.95,
+                top_p=args.t_top_p,
+                top_k=args.t_top_k,
+                min_p=args.t_min_p,
                 max_new_tokens=args.max_new_tokens,
             )
         )
@@ -482,6 +484,8 @@ async def run(args: argparse.Namespace):
                 max_model_len=args.max_model_len,
                 temperature=args.gen_temp,
                 top_p=args.gen_top_p,
+                top_k=args.gen_top_k,
+                min_p=args.gen_min_p,
                 max_new_tokens=args.max_new_tokens,
             )
         )
@@ -495,6 +499,8 @@ async def run(args: argparse.Namespace):
                 max_model_len=args.max_model_len,
                 temperature=args.ver_temp,
                 top_p=args.ver_top_p,
+                top_k=args.ver_top_k,
+                min_p=args.ver_min_p,
                 max_new_tokens=args.max_new_tokens,
             )
         )
@@ -631,17 +637,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rounds", type=int, default=2, help="Number of gen/ver pairs (total iterations = 2*rounds).")
     p.add_argument("--batch_tasks", type=int, default=64)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--teacher_base", type=str, default="Qwen/Qwen3-4B")
+    p.add_argument("--teacher_base", type=str, default="Qwen/Qwen3-8B")
     p.add_argument("--gen_base", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument("--ver_base", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument("--teacher_tokenizer", type=str, default=None)
     p.add_argument("--gen_tokenizer", type=str, default=None)
     p.add_argument("--ver_tokenizer", type=str, default=None)
-    p.add_argument("--t_temp", type=float, default=0.0)
-    p.add_argument("--gen_temp", type=float, default=0.3)
-    p.add_argument("--ver_temp", type=float, default=0.2)
+    p.add_argument("--t_temp", type=float, default=0.6)
+    p.add_argument("--gen_temp", type=float, default=0.6)
+    p.add_argument("--ver_temp", type=float, default=0.6)
+    p.add_argument("--t_top_p", type=float, default=0.95)
     p.add_argument("--gen_top_p", type=float, default=0.95)
-    p.add_argument("--ver_top_p", type=float, default=0.9)
+    p.add_argument("--ver_top_p", type=float, default=0.95)
+    p.add_argument("--t_top_k", type=int, default=20)
+    p.add_argument("--gen_top_k", type=int, default=20)
+    p.add_argument("--ver_top_k", type=int, default=20)
+    p.add_argument("--t_min_p", type=float, default=0.0)
+    p.add_argument("--gen_min_p", type=float, default=0.0)
+    p.add_argument("--ver_min_p", type=float, default=0.0)
     p.add_argument("--max_turns", type=int, default=4)
     p.add_argument("--stop_on_verifier_fix", action="store_true")
     p.add_argument("--collect_for", choices=["auto", "both", "gen", "ver"], default="auto")
@@ -649,9 +662,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tp_s", type=int, default=1)
     p.add_argument("--tp_t", type=int, default=1)
     p.add_argument("--max_model_len", type=int, default=32768)
-    p.add_argument("--teacher_gpu_mem_util", type=float, default=0.6)
-    p.add_argument("--gen_gpu_mem_util", type=float, default=0.5)
-    p.add_argument("--ver_gpu_mem_util", type=float, default=0.5)
+    p.add_argument("--teacher_gpu_mem_util", type=float, default=0.9)
+    p.add_argument("--gen_gpu_mem_util", type=float, default=0.9)
+    p.add_argument("--ver_gpu_mem_util", type=float, default=0.9)
     p.add_argument("--max_new_tokens", type=int, default=8192)
     p.add_argument(
         "--train_truncate_tokens",
