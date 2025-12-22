@@ -64,6 +64,24 @@ def _think_incomplete(text: str) -> bool:
     return THOUGHT_DELIMITER_START in text
 
 
+def _coerce_ground_truth(task: Any) -> Any:
+    if isinstance(task, dict):
+        for key in ("ground_truth", "answer", "solution", "label", "gt"):
+            val = task.get(key)
+            if val not in (None, ""):
+                return val
+    return getattr(task, "ground_truth", None)
+
+
+def _answer_is_correct(answer: str, ground_truth: Any) -> Optional[bool]:
+    if ground_truth in (None, ""):
+        return None
+    if not answer:
+        return False
+    reward_obj = math_reward_fn({"question": None, "ground_truth": ground_truth}, answer)
+    return bool(reward_obj.is_correct)
+
+
 def _question_text_from_raw(raw_question: Any) -> str:
     """Best-effort extraction of the user question from various schemas."""
     try:
@@ -149,7 +167,7 @@ class PAGStyleWorkflow(Workflow):
         gt = task.get("ground_truth")
         # Always coerce raw_question into plain text
         question_text = _question_text_from_raw(raw_question)
-        gen_hist: List[Dict[str, str]] = [
+        gen_hist_raw: List[Dict[str, str]] = [
             {"role": "system", "content": GEN_SYSTEM},
             {"role": "user", "content": question_text},
         ]
@@ -162,14 +180,18 @@ class PAGStyleWorkflow(Workflow):
 
         for t in range(self.max_turns):
             # === Generator turn ===
-            gen_prompt = trim_history(gen_hist, limit=MAX_ROLLOUT_HISTORY)
+            gen_prompt = trim_history(gen_hist_raw, limit=MAX_ROLLOUT_HISTORY)
             gen_prompt_for_teacher = [dict(m) for m in gen_prompt]
-            g_out = await call_engine(self.gen_engine, gen_prompt)
+            g_out = await call_engine(
+                self.gen_engine,
+                gen_prompt,
+                chat_template_kwargs={"enable_thinking": True},
+            )
             g_msg_raw = g_out["content"].strip()
             think_incomplete = _think_incomplete(g_msg_raw)
             g_msg_public = _strip_think(g_msg_raw)
-            gen_hist.append({"role": "assistant", "content": g_msg_public})
-            gen_ctx = [dict(m) for m in trim_history(gen_hist, limit=MAX_SFT_HISTORY)]
+            gen_hist_raw.append({"role": "assistant", "content": g_msg_raw})
+            gen_ctx = [dict(m) for m in trim_history(gen_hist_raw, limit=MAX_SFT_HISTORY)]
 
             g_teacher = None
             if self.collect_for in ("both", "gen"):
@@ -206,10 +228,13 @@ class PAGStyleWorkflow(Workflow):
             )
             ver_hist.append({"role": "user", "content": verify_user})
             ver_prompt = trim_history(ver_hist, limit=MAX_ROLLOUT_HISTORY)
-            v_out = await call_engine(self.ver_engine, ver_prompt)
+            v_out = await call_engine(
+                self.ver_engine, ver_prompt, chat_template_kwargs={"enable_thinking": True}
+            )
             v_msg_raw = v_out["content"].strip()
             v_msg_public = _strip_think(v_msg_raw)
             ver_hist.append({"role": "assistant", "content": v_msg_raw})
+            ver_ctx = [dict(m) for m in trim_history(ver_hist, limit=MAX_SFT_HISTORY)]
 
             v_teacher = None
             if self.collect_for in ("both", "ver"):
@@ -221,10 +246,7 @@ class PAGStyleWorkflow(Workflow):
             reward_obj = self.reward_fn({"question": question_text, "ground_truth": gt}, g_msg_raw)
             ver_traj.steps.append(
                 Step(
-                    chat_completions=[
-                        {"role": "user", "content": verify_user},
-                        {"role": "assistant", "content": v_msg_public},
-                    ],
+                    chat_completions=ver_ctx,
                     reward=float(reward_obj.reward),
                     info={
                         "turn_index": t,
@@ -248,7 +270,7 @@ class PAGStyleWorkflow(Workflow):
             regen_user = (
                 f"{PAG_REGENERATE_PROMPT}\n\nQuestion:\n{question_text}\n\nVerifier feedback:\n{v_msg_public}"
             )
-            gen_hist.append({"role": "user", "content": regen_user})
+            gen_hist_raw.append({"role": "user", "content": regen_user})
 
         return Episode(
             id=uid,
@@ -318,6 +340,15 @@ def pag_episodes_to_sft_rows(
     for ep in episodes:
         raw_q = ep.task.get("question") if isinstance(ep.task, dict) else getattr(ep.task, "question", None)
         question = _question_text_from_raw(raw_q)
+        ground_truth = _coerce_ground_truth(ep.task)
+        if ground_truth in (None, ""):
+            q_snip = (question or "").strip().replace("\n", " ")
+            if len(q_snip) > 120:
+                q_snip = f"{q_snip[:117]}..."
+            print(
+                f"[warn] Missing ground_truth; skipping GT filter "
+                f"(ep={getattr(ep, 'id', '?')}, question='{q_snip}')"
+            )
         for traj in ep.trajectories:
             for step in traj.steps:
                 info = step.info or {}
@@ -333,6 +364,12 @@ def pag_episodes_to_sft_rows(
                             f"(ep={getattr(ep, 'id', '?')}, turn={info.get('turn_index')})"
                         )
                     continue
+                expected_verdict: Optional[str] = None
+                if ground_truth not in (None, ""):
+                    gen_msg_raw = info.get("generator_message_raw") or info.get("student_response_raw") or ""
+                    gen_correct = _answer_is_correct(gen_msg_raw, ground_truth)
+                    if gen_correct is not None:
+                        expected_verdict = "correct" if gen_correct else "incorrect"
                 ctx = step.chat_completions or []
                 cleaned_ctx = [
                     {"role": msg["role"], "content": msg["content"]}
@@ -344,6 +381,14 @@ def pag_episodes_to_sft_rows(
                 if traj.name == "generator":
                     if not question:
                         continue  # skip unusable rows with missing question
+                    if ground_truth not in (None, ""):
+                        teacher_correct = _answer_is_correct(teacher_target, ground_truth)
+                        if teacher_correct is False:
+                            print(
+                                f"[warn] Skipping gen SFT row due to GT mismatch "
+                                f"(ep={getattr(ep, 'id', '?')}, turn={info.get('turn_index')})"
+                            )
+                            continue
                     if not cleaned_ctx:
                         cleaned_ctx = [
                             {"role": "system", "content": GEN_SYSTEM},
@@ -353,19 +398,26 @@ def pag_episodes_to_sft_rows(
                         cleaned_ctx.append({"role": "user", "content": question})
                     gen_rows.append({"messages": cleaned_ctx + [{"role": "assistant", "content": teacher_target}]})
                 elif traj.name == "verifier":
-                    generator_msg = info.get("generator_message", "")
-                    if not question or not generator_msg:
-                        continue  # skip broken rows
-                    verify_user = f"{PAG_VERIFY_PROMPT}\n\nQuestion:\n{question}\n\nPrevious answer:\n{generator_msg}"
-                    ver_rows.append(
-                        {
-                            "messages": [
-                                {"role": "system", "content": PAG_VERIFY_SYSTEM},
-                                {"role": "user", "content": verify_user},
-                                {"role": "assistant", "content": teacher_target},
-                            ]
-                        }
-                    )
+                    if expected_verdict:
+                        verdict = _extract_judgment(teacher_target)
+                        if verdict is None or verdict != expected_verdict:
+                            print(
+                                f"[warn] Skipping ver SFT row due to GT mismatch "
+                                f"(ep={getattr(ep, 'id', '?')}, turn={info.get('turn_index')})"
+                            )
+                            continue
+                    if not cleaned_ctx:
+                        generator_msg = info.get("generator_message", "")
+                        if not question or not generator_msg:
+                            continue  # skip broken rows
+                        verify_user = (
+                            f"{PAG_VERIFY_PROMPT}\n\nQuestion:\n{question}\n\nPrevious answer:\n{generator_msg}"
+                        )
+                        cleaned_ctx = [
+                            {"role": "system", "content": PAG_VERIFY_SYSTEM},
+                            {"role": "user", "content": verify_user},
+                        ]
+                    ver_rows.append({"messages": cleaned_ctx + [{"role": "assistant", "content": teacher_target}]})
     return gen_rows, ver_rows
 
 

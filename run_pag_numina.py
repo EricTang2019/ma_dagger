@@ -196,15 +196,29 @@ def _dump_jsonl(records: List[Dict[str, Any]], path: Path):
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def _sample_tasks(dataset_name: str, split: str, n: int, seed: int = 0) -> List[Dict[str, Any]]:
+def _sample_tasks(
+    dataset_name: str,
+    split: str,
+    n: int,
+    seed: int = 0,
+    *,
+    shard_idx: int = 0,
+    num_shards: int = 1,
+) -> List[Dict[str, Any]]:
     ds, reg_split = _resolve_registered_dataset(dataset_name, split)
     if ds is None:
         raise RuntimeError(f"Dataset '{dataset_name}' split '{split}' (key '{reg_split}') not found. Register it first.")
     data = ds.get_data() if hasattr(ds, "get_data") else list(ds)
     if not data:
         return []
+    if num_shards < 1:
+        raise ValueError("num_shards must be >= 1")
+    if shard_idx < 0 or shard_idx >= num_shards:
+        raise ValueError(f"shard_idx must be in [0, {num_shards - 1}]")
     rng = random.Random(seed)
     idx = list(range(len(data)))
+    if num_shards > 1:
+        idx = [i for i in idx if i % num_shards == shard_idx]
     rng.shuffle(idx)
     idx = idx[: n if n < len(idx) else len(idx)]
 
@@ -231,7 +245,7 @@ def _generator_accuracy(episodes) -> Tuple[float, int, int, List[dict]]:
         g_msg = (final_step.info or {}).get("student_response", "") or ""
         parsed_pred = extract_answer(g_msg)
         if isinstance(ep.task, dict):
-            raw_q = _coerce_question_field(ep.task)
+            raw_q = ep.task.get("question") or _coerce_question_field(ep.task)
             gt = _coerce_ground_truth_field(ep.task)
         else:
             raw_q = getattr(ep.task, "question", None)
@@ -515,7 +529,14 @@ async def run(args: argparse.Namespace):
         role = "gen" if r % 2 == 1 else "ver"
         print(f"\n[round {r:03d}] role={role} — rollout + teacher relabel + full FT + hot reload")
 
-        tasks = _sample_tasks(args.dataset_name, args.split, args.batch_tasks, seed=args.seed + r)
+        tasks = _sample_tasks(
+            args.dataset_name,
+            args.split,
+            args.batch_tasks,
+            seed=args.seed + r,
+            shard_idx=args.shard_idx,
+            num_shards=args.num_shards,
+        )
         if args.dump_tasks:
             _dump_jsonl(tasks, out_dir / f"sampled_tasks_round_{r:03d}.jsonl")
         if not tasks:
@@ -637,6 +658,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rounds", type=int, default=2, help="Number of gen/ver pairs (total iterations = 2*rounds).")
     p.add_argument("--batch_tasks", type=int, default=64)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--num_shards", type=int, default=1, help="Split dataset into N shards (default: 1).")
+    p.add_argument("--shard_idx", type=int, default=0, help="Shard index in [0, num_shards-1].")
     p.add_argument("--teacher_base", type=str, default="Qwen/Qwen3-8B")
     p.add_argument("--gen_base", type=str, default="Qwen/Qwen3-0.6B")
     p.add_argument("--ver_base", type=str, default="Qwen/Qwen3-0.6B")

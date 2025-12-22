@@ -40,6 +40,7 @@ async def teacher_label_for_generator(
     out = await call_engine(
         teacher_engine,
         student_messages,
+        chat_template_kwargs={"enable_thinking": True},
         temperature=0.6,
         top_p=0.95,
         sp_extra={"top_k": 20, "min_p": 0.0},
@@ -65,6 +66,7 @@ async def teacher_label_for_verifier(
     out = await call_engine(
         teacher_engine,
         student_messages,
+        chat_template_kwargs={"enable_thinking": True},
         temperature=0.6,
         top_p=0.95,
         sp_extra={"top_k": 20, "min_p": 0.0},
