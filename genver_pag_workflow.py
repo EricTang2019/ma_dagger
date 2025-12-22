@@ -26,6 +26,7 @@ PAG_VERIFY_PROMPT = (
     "If you find a mistake: state the wrong step and explain why it's wrong. "
     "If all steps are correct, explain why. "
     "Provide the reasoning and the final judgement of the correctness. "
+    "Include explanation in the final response (not only inside <think>). "
     "The last word of your response must be either 'correct' or 'incorrect'."
 )
 PAG_REGENERATE_PROMPT = (
