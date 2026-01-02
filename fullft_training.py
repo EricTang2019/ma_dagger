@@ -98,6 +98,20 @@ def _count_parquet_rows(paths: Sequence[str], column_hint: str = "messages") -> 
     return int(total)
 
 
+def _resolve_sft_train_files(sft_path: str) -> List[str]:
+    """Resolve a training data spec to a list of parquet files.
+
+    Supports:
+    - single parquet file path
+    - directory containing parquet shards (recursively)
+    """
+    path = Path(sft_path)
+    if path.is_dir():
+        files = sorted((p for p in path.rglob("*.parquet") if p.is_file()), key=lambda p: p.name)
+        return [str(p) for p in files]
+    return [sft_path]
+
+
 def _ensure_torchrun_env_defaults(target_env: Optional[Dict[str, str]] = None):
     env = target_env if target_env is not None else os.environ
 
@@ -314,11 +328,14 @@ def _run_fullft_one_round_inner(
     from hydra import compose, initialize_config_module
 
     _ensure_torchrun_env_defaults()
-    path_literal = json.dumps(sft_path)
+    resolved_files = _resolve_sft_train_files(sft_path)
+    if not resolved_files:
+        raise FileNotFoundError(f"No parquet shards found under '{sft_path}'.")
+    files_literal = ",".join(json.dumps(p) for p in resolved_files)
     overrides = list(config_override or [])
     overrides.extend([
-        f"data.train_files=[{path_literal}]",
-        f"data.val_files=[{path_literal}]",
+        f"data.train_files=[{files_literal}]",
+        f"data.val_files=[{files_literal}]",
         "data.multiturn.enable=true",
         f"model.partial_pretrain={base_model_path}",
         f"trainer.project_name={project_name}",

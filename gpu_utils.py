@@ -22,6 +22,29 @@ def ensure_tp_fit(devices: Optional[List[str]], tp: int, name: str):
         )
 
 
+def ensure_tp_dp_fit(devices: Optional[List[str]], tp: int, dp: int, name: str):
+    tp = max(1, int(tp or 1))
+    dp = max(1, int(dp or 1))
+    if devices is None:
+        raise ValueError(f"{name}: no CUDA devices provided")
+    required = tp * dp
+    if required > len(devices):
+        raise ValueError(
+            f"{name}: tp={tp} dp={dp} requires {required} GPUs but only {len(devices)} provided ({devices})"
+        )
+
+
+def split_devices_for_tp_dp(devices: Optional[List[str]], tp: int, dp: int, name: str) -> List[List[str]]:
+    """Partition a flat CUDA device list into `dp` groups of size `tp`."""
+    ensure_tp_dp_fit(devices, tp, dp, name)
+    assert devices is not None
+    tp = max(1, int(tp or 1))
+    dp = max(1, int(dp or 1))
+    required = tp * dp
+    selected = devices[:required]
+    return [selected[i * tp : (i + 1) * tp] for i in range(dp)]
+
+
 def devices_overlap(a: Optional[List[str]], b: Optional[List[str]]) -> bool:
     if not a or not b:
         return False

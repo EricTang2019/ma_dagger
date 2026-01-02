@@ -5,7 +5,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from rllm.rewards.math_utils.utils import extract_answer
-from vllm_engine import VLLMChatEngine, call_engine
+from vllm_engine import call_engine
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +26,9 @@ MAX_ROLLOUT_HISTORY = 12
 
 
 async def teacher_label_for_generator(
-    teacher_engine: VLLMChatEngine,
+    teacher_engine: Any,
     student_messages: List[Dict[str, str]],
+    routing_key: Optional[str] = None,
     **_: Any,
 ) -> Dict[str, Any]:
     """
@@ -41,6 +42,7 @@ async def teacher_label_for_generator(
         teacher_engine,
         student_messages,
         chat_template_kwargs={"enable_thinking": True},
+        routing_key=routing_key,
         temperature=0.6,
         top_p=0.95,
         sp_extra={"top_k": 20, "min_p": 0.0},
@@ -53,8 +55,9 @@ async def teacher_label_for_generator(
 
 
 async def teacher_label_for_verifier(
-    teacher_engine: VLLMChatEngine,
+    teacher_engine: Any,
     student_messages: List[Dict[str, str]],
+    routing_key: Optional[str] = None,
     **_: Any,
 ) -> Dict[str, Any]:
     """
@@ -67,6 +70,7 @@ async def teacher_label_for_verifier(
         teacher_engine,
         student_messages,
         chat_template_kwargs={"enable_thinking": True},
+        routing_key=routing_key,
         temperature=0.6,
         top_p=0.95,
         sp_extra={"top_k": 20, "min_p": 0.0},

@@ -187,6 +187,7 @@ class PAGStyleWorkflow(Workflow):
                 self.gen_engine,
                 gen_prompt,
                 chat_template_kwargs={"enable_thinking": True},
+                routing_key=uid,
             )
             g_msg_raw = g_out["content"].strip()
             think_incomplete = _think_incomplete(g_msg_raw)
@@ -197,7 +198,7 @@ class PAGStyleWorkflow(Workflow):
             g_teacher = None
             if self.collect_for in ("both", "gen"):
                 g_teacher = await teacher_label_for_generator_pag(
-                    self.teacher_engine, gen_prompt_for_teacher
+                    self.teacher_engine, gen_prompt_for_teacher, routing_key=uid
                 )
 
             gen_traj.steps.append(
@@ -208,6 +209,7 @@ class PAGStyleWorkflow(Workflow):
                         "turn_index": t,
                         "student_response": g_msg_public,
                         "student_response_raw": g_msg_raw,
+                        "teacher_prompt": gen_prompt_for_teacher,
                         "teacher_status": (g_teacher or {}).get("status"),
                         "teacher_justification": (g_teacher or {}).get("justification"),
                         "teacher_target": (g_teacher or {}).get("g_next_message"),
@@ -229,8 +231,12 @@ class PAGStyleWorkflow(Workflow):
             )
             ver_hist.append({"role": "user", "content": verify_user})
             ver_prompt = trim_history(ver_hist, limit=MAX_ROLLOUT_HISTORY)
+            ver_prompt_for_teacher = [dict(m) for m in ver_prompt]
             v_out = await call_engine(
-                self.ver_engine, ver_prompt, chat_template_kwargs={"enable_thinking": True}
+                self.ver_engine,
+                ver_prompt,
+                chat_template_kwargs={"enable_thinking": True},
+                routing_key=uid,
             )
             v_msg_raw = v_out["content"].strip()
             v_msg_public = _strip_think(v_msg_raw)
@@ -240,7 +246,7 @@ class PAGStyleWorkflow(Workflow):
             v_teacher = None
             if self.collect_for in ("both", "ver"):
                 v_teacher = await teacher_label_for_verifier_pag(
-                    self.teacher_engine, ver_prompt
+                    self.teacher_engine, ver_prompt, routing_key=uid
                 )
 
             # pred_for_reward = g_msg
@@ -255,6 +261,7 @@ class PAGStyleWorkflow(Workflow):
                         "student_response_raw": v_msg_raw,
                         "generator_message": g_msg_public,
                         "generator_message_raw": g_msg_raw,
+                        "teacher_prompt": ver_prompt_for_teacher,
                         "teacher_status": (v_teacher or {}).get("status"),
                         "teacher_justification": (v_teacher or {}).get("justification"),
                         "teacher_target": (v_teacher or {}).get("v_next_message"),
@@ -390,6 +397,12 @@ def pag_episodes_to_sft_rows(
                                 f"(ep={getattr(ep, 'id', '?')}, turn={info.get('turn_index')})"
                             )
                             continue
+                    if _think_incomplete(teacher_target):
+                        print(
+                            f"[warn] Skipping gen SFT row due to incomplete thinking "
+                            f"(ep={getattr(ep, 'id', '?')}, turn={info.get('turn_index')})"
+                        )
+                        continue
                     if not cleaned_ctx:
                         cleaned_ctx = [
                             {"role": "system", "content": GEN_SYSTEM},
@@ -420,6 +433,90 @@ def pag_episodes_to_sft_rows(
                         ]
                     ver_rows.append({"messages": cleaned_ctx + [{"role": "assistant", "content": teacher_target}]})
     return gen_rows, ver_rows
+
+
+async def relabel_pag_episodes_with_teacher(
+    episodes: Sequence[Episode],
+    teacher_engine,
+    *,
+    collect_for: str = "both",
+    max_new_tokens: int = 8192,
+    temperature: float = 0.6,
+    top_p: float = 0.95,
+    top_k: int = 20,
+    min_p: float = 0.0,
+    batch_size: int = 32,
+) -> Tuple[int, int]:
+    """Fill step.info['teacher_target'] offline using stored 'teacher_prompt'.
+
+    This lets rollout run without invoking the teacher, then labels all steps
+    after-the-fact (before building SFT rows).
+
+    Returns (num_gen_labeled, num_ver_labeled).
+    """
+
+    def _chunks(seq: List[Any], n: int):
+        if n <= 0:
+            n = 1
+        for i in range(0, len(seq), n):
+            yield seq[i : i + n]
+
+    gen_items: List[Tuple[Step, List[Dict[str, str]]]] = []
+    ver_items: List[Tuple[Step, List[Dict[str, str]]]] = []
+
+    for ep in episodes:
+        for traj in getattr(ep, "trajectories", []) or []:
+            want = (
+                (traj.name == "generator" and collect_for in {"both", "gen"})
+                or (traj.name == "verifier" and collect_for in {"both", "ver"})
+            )
+            if not want:
+                continue
+            for step in getattr(traj, "steps", []) or []:
+                info = step.info or {}
+                if info.get("teacher_target"):
+                    continue
+                prompt = info.get("teacher_prompt")
+                if not prompt:
+                    continue
+                # Ensure prompt is a list of {role, content} dicts.
+                if not isinstance(prompt, list):
+                    continue
+                prompt_msgs = [
+                    {"role": m.get("role"), "content": m.get("content")}
+                    for m in prompt
+                    if isinstance(m, dict) and m.get("role") and m.get("content") is not None
+                ]
+                if not prompt_msgs:
+                    continue
+                step.info = info  # normalize None -> dict so we can mutate
+                if traj.name == "generator":
+                    gen_items.append((step, prompt_msgs))
+                else:
+                    ver_items.append((step, prompt_msgs))
+
+    async def _label(items: List[Tuple[Step, List[Dict[str, str]]]]) -> int:
+        labeled = 0
+        for chunk in _chunks(items, batch_size):
+            prompts = [p for _, p in chunk]
+            outs = await teacher_engine.generate_batch(
+                prompts,
+                chat_template_kwargs={"enable_thinking": True},
+                temperature=temperature,
+                top_p=top_p,
+                sp_extra={"top_k": top_k, "min_p": min_p},
+                max_tokens=max_new_tokens,
+            )
+            for (step, _), out in zip(chunk, outs):
+                step.info["teacher_status"] = "revise"
+                step.info["teacher_justification"] = ""
+                step.info["teacher_target"] = (out or "").strip()
+                labeled += 1
+        return labeled
+
+    gen_labeled = await _label(gen_items) if gen_items else 0
+    ver_labeled = await _label(ver_items) if ver_items else 0
+    return gen_labeled, ver_labeled
 
 
 def dump_pag_transcripts_with_raw(

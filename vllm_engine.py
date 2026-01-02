@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import inspect
 import logging
+import zlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -234,7 +235,68 @@ class VLLMChatEngine:
             if token_count <= budget:
                 return trial
             start += 1
-        return (head + body[-1:]) if body else head
+        if not body:
+            return head
+        tail_only = head + body[-1:]
+        token_count = len(
+            self.tok.apply_chat_template(tail_only, tokenize=True, add_generation_prompt=True, **chat_kwargs)
+        )
+        if token_count <= budget:
+            return tail_only
+        return self._truncate_last_message_to_budget(tail_only, budget, chat_kwargs)
+
+    def _truncate_last_message_to_budget(
+        self,
+        messages: List[Dict[str, str]],
+        budget: int,
+        chat_kwargs: Dict[str, Any],
+    ) -> List[Dict[str, str]]:
+        """Ensure the last message fits within the token budget by truncating its content.
+
+        vLLM will hard-error if the prompt exceeds `max_model_len`. Dropping whole messages
+        is sometimes insufficient (e.g. a single very long user message), so we truncate
+        the last message content (keeping the tail) to stay within budget.
+        """
+        if budget <= 0 or not messages:
+            return messages
+        idx = len(messages) - 1
+        content = messages[idx].get("content")
+        if not isinstance(content, str) or not content:
+            return messages
+        try:
+            content_tokens = self.tok.encode(content, add_special_tokens=False)
+        except Exception:
+            return messages
+        if not content_tokens:
+            truncated = [dict(m) for m in messages]
+            truncated[idx] = dict(truncated[idx])
+            truncated[idx]["content"] = ""
+            return truncated
+
+        best: Optional[str] = None
+        lo = 1
+        hi = len(content_tokens)
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = self.tok.decode(content_tokens[-mid:], skip_special_tokens=True)
+            trial = [dict(m) for m in messages]
+            trial[idx] = dict(trial[idx])
+            trial[idx]["content"] = candidate
+            token_count = len(
+                self.tok.apply_chat_template(trial, tokenize=True, add_generation_prompt=True, **chat_kwargs)
+            )
+            if token_count <= budget:
+                best = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        if best is None:
+            best = ""
+        truncated = [dict(m) for m in messages]
+        truncated[idx] = dict(truncated[idx])
+        truncated[idx]["content"] = best
+        return truncated
 
     def _build_sampling_params(
         self,
@@ -391,6 +453,81 @@ class VLLMChatEngine:
             self._batcher.default_sp = self.default_sp
 
 
+class EnginePool:
+    """A thin wrapper that shards requests across multiple VLLMChatEngine replicas.
+
+    This provides inference data-parallelism (DP) by running multiple vLLM engines
+    (each possibly using tensor-parallelism internally) and routing requests across
+    them.
+    """
+
+    def __init__(self, engines: Sequence[VLLMChatEngine]):
+        if not engines:
+            raise ValueError("EnginePool requires at least one engine.")
+        self.engines: List[VLLMChatEngine] = list(engines)
+        self._rr = 0
+        self._rr_lock = asyncio.Lock()
+
+    @property
+    def tok(self):
+        return getattr(self.engines[0], "tok", None)
+
+    async def _next_engine(self) -> VLLMChatEngine:
+        async with self._rr_lock:
+            idx = self._rr % len(self.engines)
+            self._rr += 1
+        return self.engines[idx]
+
+    async def get_model_response(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
+        routing_key = kwargs.pop("routing_key", None)
+        if routing_key is None:
+            eng = await self._next_engine()
+        else:
+            # Stable hash so routing is deterministic across the run (and across Python hash seeds).
+            idx = zlib.crc32(str(routing_key).encode("utf-8")) % len(self.engines)
+            eng = self.engines[idx]
+        return await eng.get_model_response(messages, **kwargs)
+
+    async def generate_batch(self, list_of_messages: List[List[Dict[str, str]]], **kwargs) -> List[str]:
+        if not list_of_messages:
+            return []
+        if len(self.engines) == 1:
+            return await self.engines[0].generate_batch(list_of_messages, **kwargs)
+
+        buckets: List[List[List[Dict[str, str]]]] = [[] for _ in self.engines]
+        indices: List[List[int]] = [[] for _ in self.engines]
+        for idx, msgs in enumerate(list_of_messages):
+            slot = idx % len(self.engines)
+            buckets[slot].append(msgs)
+            indices[slot].append(idx)
+
+        tasks = []
+        task_indices: List[List[int]] = []
+        for eng, bucket, idxs in zip(self.engines, buckets, indices):
+            if not bucket:
+                continue
+            tasks.append(asyncio.create_task(eng.generate_batch(bucket, **kwargs)))
+            task_indices.append(idxs)
+
+        outs = await asyncio.gather(*tasks)
+        merged: List[Optional[str]] = [None] * len(list_of_messages)
+        for idxs, out_chunk in zip(task_indices, outs):
+            for original_idx, text in zip(idxs, out_chunk):
+                merged[original_idx] = text
+        return [m if m is not None else "" for m in merged]
+
+    async def hot_reload_from_dir(self, new_model_dir: str, new_tokenizer_dir: Optional[str] = None):
+        await asyncio.gather(
+            *[eng.hot_reload_from_dir(new_model_dir, new_tokenizer_dir) for eng in self.engines]
+        )
+
+    async def sleep(self, level: int = 1):
+        await asyncio.gather(*[eng.sleep(level) for eng in self.engines])
+
+    async def wake_up(self):
+        await asyncio.gather(*[eng.wake_up() for eng in self.engines])
+
+
 def _get_vllm_model_and_config(llm: LLM):
     eng = llm.llm_engine
     try:
@@ -421,5 +558,5 @@ def _load_weights_from_dir(model, model_config, new_model_dir: str):
     vllm_load_weights(model, model_config=model_config, load_format="auto", load_dir=new_model_dir)
 
 
-async def call_engine(engine: VLLMChatEngine, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
+async def call_engine(engine: Any, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
     return await engine.get_model_response(messages, **kwargs)
