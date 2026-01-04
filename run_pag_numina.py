@@ -45,6 +45,83 @@ from rllm.data.dataset import DatasetRegistry
 from rllm.rewards.reward_fn import math_reward_fn
 from vllm_engine import EnginePool, VLLMChatEngine, VLLMConfig
 
+
+def _get_hf_token_from_env() -> Optional[str]:
+    for key in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+        val = os.environ.get(key)
+        if val:
+            return val
+    return None
+
+
+def _maybe_upload_models_to_hf(
+    *,
+    round_idx: int,
+    pair_idx: int,
+    args: argparse.Namespace,
+    gen_ckpt: str,
+    ver_ckpt: str,
+    last_uploaded: Dict[str, str | None],
+) -> None:
+    """Upload latest merged HF checkpoints every N pairs (no-op if disabled).
+
+    We upload after the verifier step of each pair so both gen+ver have had a chance to update.
+    """
+
+    if args.hf_upload_every <= 0:
+        return
+    if pair_idx % args.hf_upload_every != 0:
+        return
+
+    uploads: List[Tuple[str, str]] = []
+    if args.hf_repo_gen and Path(gen_ckpt).is_dir():
+        uploads.append(("gen", gen_ckpt))
+    if args.hf_repo_ver and Path(ver_ckpt).is_dir():
+        uploads.append(("ver", ver_ckpt))
+    if not uploads:
+        return
+
+    token = _get_hf_token_from_env()
+    if not token:
+        print(
+            f"[warn] Skipping HF upload at pair {pair_idx:03d}: set HF_TOKEN or HUGGINGFACE_HUB_TOKEN to enable uploads."
+        )
+        return
+
+    try:
+        from huggingface_hub import HfApi
+    except Exception as err:
+        print(f"[warn] Skipping HF upload: huggingface_hub import failed: {err}")
+        return
+
+    api = HfApi(token=token)
+    for which, ckpt_dir in uploads:
+        repo_id = args.hf_repo_gen if which == "gen" else args.hf_repo_ver
+        if not repo_id:
+            continue
+        if last_uploaded.get(which) == ckpt_dir:
+            continue
+        try:
+            api.create_repo(
+                repo_id=repo_id,
+                repo_type="model",
+                private=args.hf_private,
+                exist_ok=True,
+            )
+            api.upload_folder(
+                folder_path=ckpt_dir,
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=f"pag round={round_idx:03d} pair={pair_idx:03d} ({which})",
+            )
+            last_uploaded[which] = ckpt_dir
+            print(f"[info] Uploaded {which} checkpoint -> hf://{repo_id} (from {ckpt_dir})")
+        except Exception as err:
+            msg = f"[warn] HF upload failed for {which} to {repo_id}: {err}"
+            if args.hf_upload_strict:
+                raise RuntimeError(msg) from err
+            print(msg)
+
 def _coerce_question_field(row: Any) -> Any:
     if isinstance(row, dict):
         # Numina schema: columns are typically problem / solution / messages / source.
@@ -1029,6 +1106,7 @@ async def run(args: argparse.Namespace):
     ver_ckpt = resolve_model_dir_for_vllm(args.ver_base)
     prev_gen_ckpt: Path | None = None
     prev_ver_ckpt: Path | None = None
+    last_uploaded_hf: Dict[str, str | None] = {"gen": None, "ver": None}
 
     rounds = args.rounds * 2
     pair_tasks: Optional[List[Dict[str, Any]]] = None
@@ -1244,6 +1322,15 @@ async def run(args: argparse.Namespace):
             out_dir=out_dir,
             sleep_state=sleep_state,
         )
+        if role == "ver":
+            _maybe_upload_models_to_hf(
+                round_idx=r,
+                pair_idx=pair_idx + 1,
+                args=args,
+                gen_ckpt=gen_ckpt,
+                ver_ckpt=ver_ckpt,
+                last_uploaded=last_uploaded_hf,
+            )
 
     print("\nTraining finished.")
 
@@ -1352,6 +1439,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out_dir", type=str, default="runs/pag_numina")
     p.add_argument("--project_name", type=str, default="pag_numina")
     p.add_argument("--experiment_name", type=str, default="exp")
+    p.add_argument(
+        "--hf_repo_gen",
+        type=str,
+        default="",
+        help="Optional Hugging Face repo_id to upload generator checkpoints (e.g., user/pag_gen).",
+    )
+    p.add_argument(
+        "--hf_repo_ver",
+        type=str,
+        default="",
+        help="Optional Hugging Face repo_id to upload verifier checkpoints (e.g., user/pag_ver).",
+    )
+    p.add_argument(
+        "--hf_upload_every",
+        type=int,
+        default=0,
+        help="If >0, upload latest gen/ver checkpoints every N outer rounds (a gen+ver pair).",
+    )
+    p.add_argument(
+        "--hf_private",
+        action="store_true",
+        help="Create/upload to private Hugging Face repos (requires permission).",
+    )
+    p.add_argument(
+        "--hf_upload_strict",
+        action="store_true",
+        help="If set, fail the run when Hugging Face upload fails (default: warn and continue).",
+    )
     p.add_argument("--config_name", type=str, default="agent_sft_trainer")
     p.add_argument("--config_override", nargs="*", default=None)
     p.add_argument("--gen_sft_path", type=str, default=None)
