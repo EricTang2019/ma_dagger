@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import uuid
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from tqdm import tqdm
 
@@ -288,6 +290,221 @@ class PAGStyleWorkflow(Workflow):
             metrics={},
             termination_reason=TerminationReason.ENV_DONE,
         )
+
+
+@dataclass
+class _PhasedTaskState:
+    uid: str
+    task: Dict[str, Any]
+    question_text: str
+    ground_truth: Any
+    gen_hist_raw: List[Dict[str, str]]
+    ver_hist: List[Dict[str, str]]
+    gen_traj: Trajectory
+    ver_traj: Trajectory
+    done: bool = False
+    is_correct: bool = False
+    last_gen_raw: str = ""
+    last_gen_public: str = ""
+    last_gen_think_incomplete: bool = False
+
+
+def _chunk_indices(total: int, n: int) -> List[Tuple[int, int]]:
+    if n <= 0:
+        n = total or 1
+    return [(i, min(i + n, total)) for i in range(0, total, n)]
+
+
+async def rollout_with_pag_phased(
+    tasks: List[Dict[str, Any]],
+    *,
+    gen_batch: Callable[[List[List[Dict[str, str]]], List[str]], Awaitable[List[str]]],
+    ver_batch: Callable[[List[List[Dict[str, str]]], List[str]], Awaitable[List[str]]],
+    max_turns: int,
+    parallel: int = 64,
+    reward_function=math_reward_fn,
+) -> List[Episode]:
+    """Run PAG in phased batches: all-gen then all-ver, repeating for turns.
+
+    This is useful when generator/verifier share the same GPUs: wake only one
+    engine at a time, run a large batch, then sleep it and switch.
+    """
+
+    if max_turns <= 0:
+        max_turns = 1
+
+    states: List[_PhasedTaskState] = []
+    for task in tasks:
+        raw_q = task.get("question")
+        question_text = _question_text_from_raw(raw_q)
+        gt = _coerce_ground_truth(task)
+        uid = f"{uuid.uuid4()}:0"
+        gen_hist_raw: List[Dict[str, str]] = [
+            {"role": "system", "content": GEN_SYSTEM},
+            {"role": "user", "content": question_text},
+        ]
+        ver_hist: List[Dict[str, str]] = [{"role": "system", "content": PAG_VERIFY_SYSTEM}]
+        states.append(
+            _PhasedTaskState(
+                uid=uid,
+                task=task,
+                question_text=question_text,
+                ground_truth=gt,
+                gen_hist_raw=gen_hist_raw,
+                ver_hist=ver_hist,
+                gen_traj=Trajectory(name="generator", steps=[]),
+                ver_traj=Trajectory(name="verifier", steps=[]),
+            )
+        )
+
+    total_tasks = len(states)
+    pbar = tqdm(total=total_tasks, desc="PAG questions", position=1, leave=True, unit="q")
+    done_count = 0
+
+    def _mark_done(state: _PhasedTaskState, correct: bool):
+        nonlocal done_count
+        if state.done:
+            return
+        state.done = True
+        state.is_correct = bool(correct)
+        done_count += 1
+        pbar.update(1)
+
+    for t in range(max_turns):
+        active = [s for s in states if not s.done]
+        if not active:
+            break
+
+        # === Generator phase (batched) ===
+        gen_prompts: List[List[Dict[str, str]]] = []
+        gen_teacher_prompts: List[List[Dict[str, str]]] = []
+        gen_uids: List[str] = []
+        for s in active:
+            prompt = trim_history(s.gen_hist_raw, limit=MAX_ROLLOUT_HISTORY)
+            gen_prompts.append(prompt)
+            gen_teacher_prompts.append([dict(m) for m in prompt])
+            gen_uids.append(s.uid)
+
+        gen_outputs: List[str] = [""] * len(gen_prompts)
+        for start, end in _chunk_indices(len(gen_prompts), parallel):
+            outs = await gen_batch(gen_prompts[start:end], gen_uids[start:end])
+            for i, out in enumerate(outs, start=start):
+                gen_outputs[i] = (out or "").strip()
+
+        for s, teacher_prompt, g_msg_raw in zip(active, gen_teacher_prompts, gen_outputs):
+            think_incomplete = _think_incomplete(g_msg_raw)
+            g_msg_public = _strip_think(g_msg_raw)
+            s.last_gen_raw = g_msg_raw
+            s.last_gen_public = g_msg_public
+            s.last_gen_think_incomplete = think_incomplete
+
+            s.gen_hist_raw.append({"role": "assistant", "content": g_msg_raw})
+            gen_ctx = [dict(m) for m in trim_history(s.gen_hist_raw, limit=MAX_SFT_HISTORY)]
+            s.gen_traj.steps.append(
+                Step(
+                    chat_completions=gen_ctx,
+                    reward=None,
+                    info={
+                        "turn_index": t,
+                        "student_response": g_msg_public,
+                        "student_response_raw": g_msg_raw,
+                        "teacher_prompt": teacher_prompt,
+                        "teacher_status": None,
+                        "teacher_justification": None,
+                        "teacher_target": None,
+                    },
+                )
+            )
+
+        # === Verifier phase (batched) ===
+        ver_prompts: List[List[Dict[str, str]]] = []
+        ver_teacher_prompts: List[List[Dict[str, str]]] = []
+        ver_uids: List[str] = []
+        ver_states: List[_PhasedTaskState] = []
+
+        for s in active:
+            ver_input_msg = s.last_gen_raw if s.last_gen_think_incomplete else s.last_gen_public
+            incomplete_note = ""
+            if s.last_gen_think_incomplete:
+                incomplete_note = (
+                    "\n\nNote: The generator's response contains an unfinished <think> block "
+                    "(missing </think>). Treat this as incorrect, but still review the reasoning "
+                    "and mention any other errors you find."
+                )
+            verify_user = (
+                f"{PAG_VERIFY_PROMPT}{incomplete_note}\n\nQuestion:\n{s.question_text}\n\nPrevious answer:\n{ver_input_msg}"
+            )
+            s.ver_hist.append({"role": "user", "content": verify_user})
+            prompt = trim_history(s.ver_hist, limit=MAX_ROLLOUT_HISTORY)
+            ver_prompts.append(prompt)
+            ver_teacher_prompts.append([dict(m) for m in prompt])
+            ver_uids.append(s.uid)
+            ver_states.append(s)
+
+        ver_outputs: List[str] = [""] * len(ver_prompts)
+        for start, end in _chunk_indices(len(ver_prompts), parallel):
+            outs = await ver_batch(ver_prompts[start:end], ver_uids[start:end])
+            for i, out in enumerate(outs, start=start):
+                ver_outputs[i] = (out or "").strip()
+
+        for s, teacher_prompt, v_msg_raw in zip(ver_states, ver_teacher_prompts, ver_outputs):
+            v_msg_public = _strip_think(v_msg_raw)
+            s.ver_hist.append({"role": "assistant", "content": v_msg_raw})
+            ver_ctx = [dict(m) for m in trim_history(s.ver_hist, limit=MAX_SFT_HISTORY)]
+
+            reward_obj = reward_function({"question": s.question_text, "ground_truth": s.ground_truth}, s.last_gen_raw)
+            s.ver_traj.steps.append(
+                Step(
+                    chat_completions=ver_ctx,
+                    reward=float(reward_obj.reward),
+                    info={
+                        "turn_index": t,
+                        "student_response": v_msg_public,
+                        "student_response_raw": v_msg_raw,
+                        "generator_message": s.last_gen_public,
+                        "generator_message_raw": s.last_gen_raw,
+                        "teacher_prompt": teacher_prompt,
+                        "teacher_status": None,
+                        "teacher_justification": None,
+                        "teacher_target": None,
+                    },
+                )
+            )
+
+            judgment = _extract_judgment(v_msg_raw)
+            if judgment == "correct":
+                _mark_done(s, True)
+                continue
+
+            if t + 1 >= max_turns:
+                _mark_done(s, False)
+                continue
+
+            regen_user = (
+                f"{PAG_REGENERATE_PROMPT}\n\nQuestion:\n{s.question_text}\n\nVerifier feedback:\n{v_msg_public}"
+            )
+            s.gen_hist_raw.append({"role": "user", "content": regen_user})
+
+    # Any remaining tasks that never received a "correct" verdict are incorrect.
+    for s in states:
+        if not s.done:
+            _mark_done(s, False)
+
+    pbar.close()
+
+    episodes: List[Episode] = []
+    for s in states:
+        episodes.append(
+            Episode(
+                id=s.uid,
+                task=s.task,
+                trajectories=[s.gen_traj, s.ver_traj],
+                is_correct=bool(s.is_correct),
+                metrics={},
+                termination_reason=TerminationReason.ENV_DONE,
+            )
+        )
+    return episodes
 
 
 async def rollout_with_pag_workflow_engine(

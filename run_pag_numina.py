@@ -28,6 +28,7 @@ from fullft_training import run_fullft_one_round
 from genver_pag_workflow import (
     pag_episodes_to_sft_rows,
     relabel_pag_episodes_with_teacher,
+    rollout_with_pag_phased,
     rollout_with_pag_workflow_engine,
     dump_pag_transcripts_with_raw,
 )
@@ -467,6 +468,33 @@ def _write_sft_parquet_shard(
     return str(shard_path)
 
 
+def _write_latest_sft_parquet(
+    rows: List[Dict[str, Any]],
+    latest_dir: Path,
+    *,
+    label: str,
+    round_idx: int,
+    tokenizer=None,
+    max_tokens: int = 0,
+) -> str:
+    if not rows:
+        return ""
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    for old in latest_dir.glob("*.parquet"):
+        try:
+            old.unlink()
+        except Exception:
+            continue
+    return _write_sft_parquet_shard(
+        rows,
+        latest_dir,
+        label=label,
+        round_idx=round_idx,
+        tokenizer=tokenizer,
+        max_tokens=max_tokens,
+    )
+
+
 def _infer_train_dp_size(train_cuda: Optional[str]) -> int:
     def _safe_parse(spec: Optional[str]) -> Optional[List[str]]:
         if not spec:
@@ -651,6 +679,7 @@ async def _run_eval_if_needed(
     ver_engine,
     teacher_engine,
     out_dir: Path,
+    sleep_state: Optional[Dict[str, bool]] = None,
 ):
     if args.eval_num_tasks <= 0 or (round_idx % args.eval_every != 0):
         return
@@ -661,16 +690,54 @@ async def _run_eval_if_needed(
     if not eval_tasks:
         print(f"[round {round_idx:03d}] No eval tasks found for {eval_ds}/{eval_split}; skipping eval.")
         return
-    eval_episodes = await rollout_with_pag_workflow_engine(
-        tasks=eval_tasks,
-        gen_engine=gen_engine,
-        ver_engine=ver_engine,
-        teacher_engine=teacher_engine,
-        max_turns=args.max_turns,
-        collect_for="none",
-        parallel=args.eval_parallel or args.parallel,
-        retry=1,
-    )
+    if args.rollout_mode == "phased":
+        async def _gen_batch(prompts, uids):
+            await _sleep_engines([("verifier", ver_engine)], sleep_state)
+            await _wake_engines([("generator", gen_engine)], sleep_state)
+            outs = await gen_engine.generate_batch(
+                prompts,
+                chat_template_kwargs={"enable_thinking": True},
+                temperature=args.gen_temp,
+                top_p=args.gen_top_p,
+                sp_extra={"top_k": args.gen_top_k, "min_p": args.gen_min_p},
+                max_tokens=args.max_new_tokens,
+            )
+            await _sleep_engines([("generator", gen_engine)], sleep_state)
+            return outs
+
+        async def _ver_batch(prompts, uids):
+            await _sleep_engines([("generator", gen_engine)], sleep_state)
+            await _wake_engines([("verifier", ver_engine)], sleep_state)
+            outs = await ver_engine.generate_batch(
+                prompts,
+                chat_template_kwargs={"enable_thinking": True},
+                temperature=args.ver_temp,
+                top_p=args.ver_top_p,
+                sp_extra={"top_k": args.ver_top_k, "min_p": args.ver_min_p},
+                max_tokens=args.max_new_tokens,
+            )
+            await _sleep_engines([("verifier", ver_engine)], sleep_state)
+            return outs
+
+        await _sleep_engines([("generator", gen_engine), ("verifier", ver_engine)], sleep_state)
+        eval_episodes = await rollout_with_pag_phased(
+            eval_tasks,
+            gen_batch=_gen_batch,
+            ver_batch=_ver_batch,
+            max_turns=args.max_turns,
+            parallel=args.eval_parallel or args.parallel,
+        )
+    else:
+        eval_episodes = await rollout_with_pag_workflow_engine(
+            tasks=eval_tasks,
+            gen_engine=gen_engine,
+            ver_engine=ver_engine,
+            teacher_engine=teacher_engine,
+            max_turns=args.max_turns,
+            collect_for="none",
+            parallel=args.eval_parallel or args.parallel,
+            retry=1,
+        )
     acc, correct, total, records = _generator_accuracy(eval_episodes)
     print(f"[round {round_idx:03d}] eval accuracy={acc:.3f} ({correct}/{total}) on {eval_ds}/{eval_split}")
     dump_path = _dump_accuracy_details(records, out_dir, round_idx, tag="eval")
@@ -743,6 +810,8 @@ async def run(args: argparse.Namespace):
     else:
         gen_sft_path = str(out_dir / "gen_sft.jsonl") if not args.gen_sft_path else args.gen_sft_path
         ver_sft_path = str(out_dir / "ver_sft.jsonl") if not args.ver_sft_path else args.ver_sft_path
+    latest_gen_dir = out_dir / "gen_sft_latest"
+    latest_ver_dir = out_dir / "ver_sft_latest"
 
     teacher_devices = parse_cuda_list(args.teacher_cuda)
     gen_devices = parse_cuda_list(args.gen_cuda)
@@ -758,6 +827,21 @@ async def run(args: argparse.Namespace):
             warn_overlap("teacher & verifier")
     if devices_overlap(gen_devices, ver_devices):
         warn_overlap("generator & verifier")
+        if args.rollout_mode == "workflow":
+            if args.pipeline_mode == "staged":
+                print(
+                    "[warn] generator & verifier share GPUs with --rollout_mode=workflow; "
+                    "switching to --rollout_mode=phased so gen/ver can alternate via sleep/wake.",
+                    flush=True,
+                )
+                args.rollout_mode = "phased"
+            else:
+                print(
+                    "[warn] generator & verifier share GPUs with --rollout_mode=workflow; "
+                    "gen/ver requests will interleave across episodes and may OOM. "
+                    "Prefer --pipeline_mode=staged --rollout_mode=phased for debug on shared GPUs.",
+                    flush=True,
+                )
 
     def _build_engine_pool(*, label: str, devices: Optional[List[str]], cfg: VLLMConfig, dp: int):
         groups = split_devices_for_tp_dp(devices, cfg.tp, dp, label)
@@ -769,6 +853,8 @@ async def run(args: argparse.Namespace):
             return engines[0]
         print(f"[info] {label} inference DP={len(engines)} TP={cfg.tp} (GPUs={len(groups) * cfg.tp})")
         return EnginePool(engines)
+
+    sleep_state: Dict[str, bool] = {"teacher": False, "generator": False, "verifier": False}
 
     teacher_engine = None
     gen_engine = _build_engine_pool(
@@ -790,6 +876,8 @@ async def run(args: argparse.Namespace):
             batch_flush_ms=args.vllm_batch_flush_ms,
         ),
     )
+    if devices_overlap(gen_devices, ver_devices) and args.rollout_mode == "phased":
+        await _sleep_engines([("generator", gen_engine)], sleep_state)
     ver_engine = _build_engine_pool(
         label="verifier",
         devices=ver_devices,
@@ -809,8 +897,8 @@ async def run(args: argparse.Namespace):
             batch_flush_ms=args.vllm_batch_flush_ms,
         ),
     )
-
-    sleep_state: Dict[str, bool] = {"teacher": False, "generator": False, "verifier": False}
+    if devices_overlap(gen_devices, ver_devices) and args.rollout_mode == "phased":
+        await _sleep_engines([("verifier", ver_engine)], sleep_state)
 
     async def _ensure_teacher_awake():
         nonlocal teacher_engine
@@ -922,11 +1010,17 @@ async def run(args: argparse.Namespace):
             if args.pipeline_mode == "inline":
                 await _wake_engines(sleepers)
             else:
-                await _ensure_genver_awake()
+                # In staged mode, only wake the engine we need for hot reload.
+                label = "generator" if which == "gen" else "verifier"
+                await _wake_engines([(label, engine)], sleep_state)
 
         new_ckpt_root = Path(new_ckpt)
         new_base_model_path = resolve_model_dir_for_vllm(new_ckpt)
         await engine.hot_reload_from_dir(new_base_model_path)
+        if args.pipeline_mode == "staged" and args.rollout_mode == "phased":
+            # Keep engines asleep between phases/rounds when sharing GPUs.
+            label = "generator" if which == "gen" else "verifier"
+            await _sleep_engines([(label, engine)], sleep_state)
         cleanup_checkpoint_dir(prev_ckpt, new_ckpt_root, train_out_dir)
         print(f"[round {r:03d}] {which} hot-reloaded -> {new_base_model_path}")
         return new_base_model_path, new_ckpt_root
@@ -963,18 +1057,59 @@ async def run(args: argparse.Namespace):
             print(f"[round {r:03d}] No tasks sampled; check dataset registration.")
             continue
         collect_for = role if args.collect_for == "auto" else args.collect_for
-        if args.pipeline_mode == "staged":
-            await _ensure_genver_awake()
-        episodes = await rollout_with_pag_workflow_engine(
-            tasks=tasks,
-            gen_engine=gen_engine,
-            ver_engine=ver_engine,
-            teacher_engine=teacher_engine,
-            max_turns=args.max_turns,
-            collect_for=("none" if args.pipeline_mode == "staged" else collect_for),
-            parallel=args.parallel,
-            retry=1,
-        )
+        if args.rollout_mode == "phased":
+            if args.pipeline_mode != "staged":
+                raise ValueError("--rollout_mode=phased requires --pipeline_mode=staged (teacher is offline).")
+
+            async def _gen_batch(prompts, uids):
+                await _sleep_engines([("verifier", ver_engine)], sleep_state)
+                await _wake_engines([("generator", gen_engine)], sleep_state)
+                outs = await gen_engine.generate_batch(
+                    prompts,
+                    chat_template_kwargs={"enable_thinking": True},
+                    temperature=args.gen_temp,
+                    top_p=args.gen_top_p,
+                    sp_extra={"top_k": args.gen_top_k, "min_p": args.gen_min_p},
+                    max_tokens=args.max_new_tokens,
+                )
+                await _sleep_engines([("generator", gen_engine)], sleep_state)
+                return outs
+
+            async def _ver_batch(prompts, uids):
+                await _sleep_engines([("generator", gen_engine)], sleep_state)
+                await _wake_engines([("verifier", ver_engine)], sleep_state)
+                outs = await ver_engine.generate_batch(
+                    prompts,
+                    chat_template_kwargs={"enable_thinking": True},
+                    temperature=args.ver_temp,
+                    top_p=args.ver_top_p,
+                    sp_extra={"top_k": args.ver_top_k, "min_p": args.ver_min_p},
+                    max_tokens=args.max_new_tokens,
+                )
+                await _sleep_engines([("verifier", ver_engine)], sleep_state)
+                return outs
+
+            await _ensure_genver_asleep()
+            episodes = await rollout_with_pag_phased(
+                tasks,
+                gen_batch=_gen_batch,
+                ver_batch=_ver_batch,
+                max_turns=args.max_turns,
+                parallel=args.parallel,
+            )
+        else:
+            if args.pipeline_mode == "staged":
+                await _ensure_genver_awake()
+            episodes = await rollout_with_pag_workflow_engine(
+                tasks=tasks,
+                gen_engine=gen_engine,
+                ver_engine=ver_engine,
+                teacher_engine=teacher_engine,
+                max_turns=args.max_turns,
+                collect_for=("none" if args.pipeline_mode == "staged" else collect_for),
+                parallel=args.parallel,
+                retry=1,
+            )
         if getattr(args, "dump_transcripts_raw", False):
             dump_pag_transcripts_with_raw(episodes, out_dir / f"transcripts_raw_round_{r:03d}.jsonl")
         acc, correct, total, acc_records = _generator_accuracy(episodes)
@@ -1009,6 +1144,8 @@ async def run(args: argparse.Namespace):
             episodes,
             collect_for=collect_for,
         )
+        latest_gen_sft = ""
+        latest_ver_sft = ""
         if args.sft_storage == "parquet_shards":
             if role in {"gen", "both"} and gen_rows:
                 shard_path = _write_sft_parquet_shard(
@@ -1019,6 +1156,7 @@ async def run(args: argparse.Namespace):
                     tokenizer=getattr(gen_engine, "tok", None),
                     max_tokens=args.train_truncate_tokens,
                 )
+                latest_gen_sft = shard_path
                 print(f"[round {r:03d}] +{len(gen_rows)} gen rows -> {shard_path}")
                 if args.sft_mirror_jsonl:
                     _append_jsonl(gen_rows, out_dir / "gen_sft.jsonl")
@@ -1031,6 +1169,7 @@ async def run(args: argparse.Namespace):
                     tokenizer=getattr(ver_engine, "tok", None),
                     max_tokens=args.train_truncate_tokens,
                 )
+                latest_ver_sft = shard_path
                 print(f"[round {r:03d}] +{len(ver_rows)} ver rows -> {shard_path}")
                 if args.sft_mirror_jsonl:
                     _append_jsonl(ver_rows, out_dir / "ver_sft.jsonl")
@@ -1038,25 +1177,46 @@ async def run(args: argparse.Namespace):
             if role in {"gen", "both"} and gen_rows:
                 append_sft_rows(gen_rows, gen_sft_path)
                 print(f"[round {r:03d}] +{len(gen_rows)} gen rows -> {gen_sft_path}")
+                if args.train_latest_only:
+                    latest_gen_sft = _write_latest_sft_parquet(
+                        gen_rows,
+                        latest_gen_dir,
+                        label="gen_sft_latest",
+                        round_idx=r,
+                        tokenizer=getattr(gen_engine, "tok", None),
+                        max_tokens=args.train_truncate_tokens,
+                    )
             if role in {"ver", "both"} and ver_rows:
                 append_sft_rows(ver_rows, ver_sft_path)
                 print(f"[round {r:03d}] +{len(ver_rows)} ver rows -> {ver_sft_path}")
+                if args.train_latest_only:
+                    latest_ver_sft = _write_latest_sft_parquet(
+                        ver_rows,
+                        latest_ver_dir,
+                        label="ver_sft_latest",
+                        round_idx=r,
+                        tokenizer=getattr(ver_engine, "tok", None),
+                        max_tokens=args.train_truncate_tokens,
+                    )
+
+        gen_train_path = latest_gen_sft if args.train_latest_only else gen_sft_path
+        ver_train_path = latest_ver_sft if args.train_latest_only else ver_sft_path
 
         exp_name = f"{args.experiment_name}_{role}_r{r:03d}"
-        if role == "gen" and Path(gen_sft_path).exists():
+        if role == "gen" and gen_train_path and Path(gen_train_path).exists():
             gen_ckpt, prev_gen_ckpt = await _train_and_hot_reload(
                 which="gen",
-                sft_path=gen_sft_path,
+                sft_path=gen_train_path,
                 base_model_path=gen_ckpt,
                 train_out_dir=train_out_dir_gen,
                 engine=gen_engine,
                 prev_ckpt=prev_gen_ckpt,
                 experiment_name=exp_name,
             )
-        elif role == "ver" and Path(ver_sft_path).exists():
+        elif role == "ver" and ver_train_path and Path(ver_train_path).exists():
             ver_ckpt, prev_ver_ckpt = await _train_and_hot_reload(
                 which="ver",
-                sft_path=ver_sft_path,
+                sft_path=ver_train_path,
                 base_model_path=ver_ckpt,
                 train_out_dir=train_out_dir_ver,
                 engine=ver_engine,
@@ -1066,8 +1226,13 @@ async def run(args: argparse.Namespace):
         else:
             print(f"[round {r:03d}] no SFT rows for {role}, skipping FT.")
 
-        # If eval is enabled, ensure gen/ver are awake for rollout.
-        if args.pipeline_mode == "staged" and args.eval_num_tasks > 0 and (r % args.eval_every == 0):
+        # If eval is enabled, ensure gen/ver are awake for the legacy workflow runner.
+        if (
+            args.rollout_mode == "workflow"
+            and args.pipeline_mode == "staged"
+            and args.eval_num_tasks > 0
+            and (r % args.eval_every == 0)
+        ):
             await _ensure_genver_awake()
 
         await _run_eval_if_needed(
@@ -1077,6 +1242,7 @@ async def run(args: argparse.Namespace):
             ver_engine=ver_engine,
             teacher_engine=teacher_engine,
             out_dir=out_dir,
+            sleep_state=sleep_state,
         )
 
     print("\nTraining finished.")
@@ -1089,6 +1255,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dataset_name", type=str, default="numina_math")
     p.add_argument("--split", type=str, default="train")
     p.add_argument("--dataset_path", type=str, default=None, help="Optional HF/local path to register dataset if missing.")
+    p.add_argument(
+        "--rollout_mode",
+        choices=["workflow", "phased"],
+        default="workflow",
+        help="workflow: per-episode async rollout. phased: batch all gen steps then all ver steps each turn (sleep/wake between).",
+    )
     p.add_argument("--rounds", type=int, default=2, help="Number of gen/ver pairs (total iterations = 2*rounds).")
     p.add_argument("--batch_tasks", type=int, default=64)
     p.add_argument("--seed", type=int, default=0)
@@ -1189,6 +1361,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["jsonl", "parquet_shards"],
         default="jsonl",
         help="Where to store accumulated SFT rows. parquet_shards avoids rereading the full JSONL each round.",
+    )
+    p.add_argument(
+        "--train_latest_only",
+        action="store_true",
+        help="Train only on newly generated SFT rows each round (keep full history on disk).",
     )
     p.add_argument(
         "--sft_mirror_jsonl",
