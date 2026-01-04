@@ -33,7 +33,7 @@ python run_pag_numina.py \
   --project_name pag_8gpu_latest_800 --experiment_name pag_8gpu_latest_800 \
   --out_dir "$OUT_DIR" \
   --hf_repo_gen "$HF_REPO_GEN" --hf_repo_ver "$HF_REPO_VER" --hf_upload_every "$HF_UPLOAD_EVERY" \
-  --rounds 50 --batch_tasks 800 --parallel 800 --max_turns 2 \
+  --rounds 200 --batch_tasks 800 --parallel 800 --max_turns 2 \
   --pipeline_mode staged --rollout_mode phased \
   --train_cuda 0,1,2,3,4,5,6,7 \
   --gen_cuda 0,1,2,3,4,5,6,7 --ver_cuda 0,1,2,3,4,5,6,7 --teacher_cuda 0,1,2,3,4,5,6,7 \
