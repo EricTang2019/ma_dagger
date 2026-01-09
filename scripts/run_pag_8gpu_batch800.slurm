@@ -21,8 +21,7 @@ conda activate madagger
 OUT_DIR=runs/pag_8gpu_batch800
 mkdir -p logs "$OUT_DIR"
 
-# Hugging Face uploads (embedded token for slurm runs).
-export HF_TOKEN=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
+# Hugging Face uploads (set HF_TOKEN outside before sbatch).
 HF_REPO_GEN="${HF_REPO_GEN:-jingwut/gen}"
 HF_REPO_VER="${HF_REPO_VER:-jingwut/ver}"
 HF_UPLOAD_EVERY="${HF_UPLOAD_EVERY:-10}"  # upload every N outer rounds (gen+ver pair)
